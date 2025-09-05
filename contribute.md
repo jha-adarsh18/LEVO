@@ -16,3 +16,29 @@ git push -u origin adarsh
 # Bhavisha:
 git checkout -b bhavisha
 git push -u origin bhavisha
+
+🔹 Everyday workflow
+
+cd PEVSLAM
+
+# 2. Switch to your branch
+git checkout adarsh     # if you are Adarsh
+git checkout bhavisha   # if you are Bhavisha
+
+# 3. Pull the latest updates from GitHub
+git pull origin <your_branch>
+
+# 4. Work on your code...
+#    (edit files, test, etc.)
+
+# 5. Stage and commit your changes
+git add .
+git commit -m "update: short description of changes"
+
+# 6. Push your work to GitHub
+git push
+
+🔹 Getting updates from the other person’s branch
+# Example: Bhavisha wants Adarsh's work
+git checkout bhavisha
+git pull origin adarsh
