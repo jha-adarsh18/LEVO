@@ -7,13 +7,16 @@ import torch
 from torch.utils.data import Dataset
 
 class EventExtractionDataset(Dataset):
-    def __init__(self, dataset_root, width = None, height = None, t = 5000):
+    def __init__(self, dataset_root, width = None, height = None, t = 1000, N = 1024):
         self.width = width
         self.height = height
         self.t = t
+        self.N = N
         self.sequences = []
+        self.time_samples = []
         self.discover_sequences(dataset_root)
         self.cache_metadata()
+        self.generate_time_samples()
     
     def discover_sequences(self, dataset_root):
         for sequence in os.listdir(dataset_root):
@@ -53,29 +56,58 @@ class EventExtractionDataset(Dataset):
                 seq_info['width'] = 1280
                 seq_info['use_ms_idx'] = True
             
-            poses = np.loadtxt(seq_info['pose_path'])
-            
             with h5py.File(seq_info['left_events_path'], "r") as e_left, \
-                 h5py.File(seq_info['right_events_path'], "r") as e_right:
-                
-                left_t_start = e_left["events/t"][0]
-                left_t_end = e_left["events/t"][-1]
-                right_t_start = e_right["events/t"][0]
-                right_t_end = e_right["events/t"][-1]
-                
-                t0 = min(left_t_start, right_t_start, poses[0, 0])
-                t1 = max(left_t_end, right_t_end, poses[-1, 0])
-                
-                seq_info['t0'] = t0
-                seq_info['t1'] = t1
-                seq_info['time_range'] = t1 - t0
-                
-                poses[:, 0] = (poses[:, 0] - t0) / (t1 - t0)
-                seq_info['poses'] = poses
+             h5py.File(seq_info['right_events_path'], "r") as e_right:
+                seq_info['time_start'] = min(float(e_left["events/t"][0]), float(e_right["events/t"][0]))
+                seq_info['time_end'] = max(float(e_left["events/t"][-1]), float(e_right["events/t"][-1]))
+
+            poses = np.loadtxt(seq_info['pose_path'])
+            seq_info['poses'] = poses
+
+    def generate_time_samples(self):
+        for seq_idx, seq_info in enumerate(self.sequences):
+            t_start = seq_info['time_start']
+            t_end = seq_info['time_end']
+            current_time = t_start
+            while current_time < t_end:
+                window_end = min(current_time + self.t, t_end)
+                self.time_samples.append((seq_idx, current_time, window_end))
+                current_time += self.t
 
     def __len__(self):
-        return len(self.sequences)
+        return len(self.time_samples)
     
+    def get_events(self, file_path, t_start, t_end, use_ms_idx=True):
+        with h5py.File(file_path, "r") as f:
+            if use_ms_idx and "ms_to_idx" in f:
+                ms_to_idx = f["ms_to_idx"]
+                ms_start =  int(t_start / 1000)
+                ms_end = int(t_end / 1000)
+                start_idx = ms_to_idx[ms_start] if ms_start < len(ms_to_idx) else len(f["events/t"]) -1
+                end_idx = ms_to_idx[ms_end] if ms_end < len(ms_to_idx) else len(f["events/t"])
+            
+            else:
+                # use binary search, mainly for MVSEC while training
+                start_idx = np.searchsorted(f["events/t"], t_start, side = "left")
+                end_idx = np.searchsorted(f["events/t"], t_end, side='right')
+
+            if start_idx > end_idx:
+                return np.array([], dtype = [('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
+            
+            x = f["events/x"][start_idx:end_idx]
+            y = f["events/y"][start_idx:end_idx]
+            t = f["events/t"][start_idx:end_idx]
+            p = f["events/p"][start_idx:end_idx]
+
+            events = np.zeros(len(x), dtype=[('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
+            
+            events['x'] = x
+            events['y'] = y
+            events['t'] = t
+            events['p'] = p.astype(np.uint8)
+
+            return events
+
     def load_and_normalize(self, seq_info, t_start, t_end):
         with h5py.File(seq_info['left_events_path'], "r") as e_left, \
              h5py.File(seq_info['right_events_path'], "r") as e_right:
