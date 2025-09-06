@@ -108,83 +108,28 @@ class EventExtractionDataset(Dataset):
 
             return events
 
-    def load_and_normalize(self, seq_info, t_start, t_end):
-        with h5py.File(seq_info['left_events_path'], "r") as e_left, \
-             h5py.File(seq_info['right_events_path'], "r") as e_right:
-            
-            t_start_norm = (t_start - seq_info['t0']) / seq_info['time_range']
-            t_end_norm = (t_end - seq_info['t0']) / seq_info['time_range']
-            
-            if seq_info['use_ms_idx']:
-                ms_to_idx_left = e_left["ms_to_idx"][:]
-                ms_to_idx_right = e_right["ms_to_idx"][:]
-                
-                ms_start = int(t_start / 1000)
-                ms_end = int(t_end / 1000)
-                
-                left_start_idx = ms_to_idx_left[ms_start] if ms_start < len(ms_to_idx_left) else len(e_left["events/t"])-1
-                left_end_idx = ms_to_idx_left[ms_end] if ms_end < len(ms_to_idx_left) else len(e_left["events/t"])
-                right_start_idx = ms_to_idx_right[ms_start] if ms_start < len(ms_to_idx_right) else len(e_right["events/t"])-1
-                right_end_idx = ms_to_idx_right[ms_end] if ms_end < len(ms_to_idx_right) else len(e_right["events/t"])
-            else:
-                left_start_idx = np.searchsorted(e_left["events/t"], t_start_norm, side='left')
-                left_end_idx = np.searchsorted(e_left["events/t"], t_end_norm, side='right')
-                right_start_idx = np.searchsorted(e_right["events/t"], t_start_norm, side='left')
-                right_end_idx = np.searchsorted(e_right["events/t"], t_end_norm, side='right')
-            
-            if left_start_idx >= left_end_idx:
-                left_norm_events = np.array([], dtype=[('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
-            else:
-                left_x = e_left["events/x"][left_start_idx:left_end_idx]
-                left_y = e_left["events/y"][left_start_idx:left_end_idx]
-                left_t = e_left["events/t"][left_start_idx:left_end_idx]
-                left_p = e_left["events/p"][left_start_idx:left_end_idx]
-                
-                left_norm_events = np.zeros(len(left_x), dtype=[('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
-                left_norm_events['x'] = left_x / seq_info['width']
-                left_norm_events['y'] = left_y / seq_info['height']
-                left_norm_events['t'] = (left_t - seq_info['t0']) / seq_info['time_range']
-                left_norm_events['p'] = left_p.astype(np.uint8)
-            
-            if right_start_idx >= right_end_idx:
-                right_norm_events = np.array([], dtype=[('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
-            else:
-                right_x = e_right["events/x"][right_start_idx:right_end_idx]
-                right_y = e_right["events/y"][right_start_idx:right_end_idx]
-                right_t = e_right["events/t"][right_start_idx:right_end_idx]
-                right_p = e_right["events/p"][right_start_idx:right_end_idx]
-                
-                right_norm_events = np.zeros(len(right_x), dtype=[('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
-                right_norm_events['x'] = right_x / seq_info['width']
-                right_norm_events['y'] = right_y / seq_info['height']
-                right_norm_events['t'] = (right_t - seq_info['t0']) / seq_info['time_range']
-                right_norm_events['p'] = right_p.astype(np.uint8)
-        
-        return left_norm_events, right_norm_events, seq_info['poses']
-    
-    def extract_events(self, seq_info, events, t_start, ms_to_idx, t=5000):
-        if len(events) == 0:
-            return events, 0.0
-        
-        if "indoor" in seq_info['sequence'].lower() or "outdoor" in seq_info['sequence'].lower():
-            t1 = t_start + t
-            start_idx = np.searchsorted(events['t'], t_start, side='left')
-            end_idx   = np.searchsorted(events['t'], t1, side='right')
-            events_slice = events[start_idx:end_idx]
-            events_duration = t1 - t_start
+    def normalize_events(self, events, width, height):
+        # Normalize events in the range [0, 1] locally for the batch
+        if  len(events) == 0:
+            return events
+        t_min = events['t'].min()
+        t_max = events['t'].max()
+
+        if t_min == t_max:
+            events['t'] = np.zeros_like(events['t'])
         else:
-            ms_start = int(t_start / 1000)
-            ms_end   = int((t_start + t) / 1000)
-            start_idx = ms_to_idx[ms_start] if ms_start < len(ms_to_idx) else len(events)-1
-            end_idx   = ms_to_idx[ms_end]   if ms_end < len(ms_to_idx) else len(events)
-            events_slice = events[start_idx:end_idx]
-            events_duration = (events['t'][end_idx-1] - events['t'][start_idx]) if len(events_slice) > 0 else 0.0
-            
-        return events_slice, events_duration
+            events['t'] = (events['t'] - t_min) / (t_max - t_min)
+        
+        events['x'] = events['x'] / width
+        events['y'] = events['y'] / height
+
+        return events
     
     def find_pose(self, poses, target_time):
+        # Find pose using binary search
+
         if len(poses) == 0:
-            return np.zeros(7, dtype=np.float32)
+            return np.zeros(7, dtype = np.float32)
         
         idx = bisect_left(poses[:, 0], target_time)
         if idx == 0:
@@ -199,42 +144,108 @@ class EventExtractionDataset(Dataset):
             else:
                 return pose_after[1:].astype(np.float32)
             
-    def __getitem__(self, idx):
-        seq_info = self.sequences[idx]
-        t = self.t
-        t_start = idx * t
-        t_end = t_start + t
-        
-        left_events_strip, right_events_strip, poses = self.load_and_normalize(seq_info, t_start, t_end)
-        
-        left_events_strip_duration = t if len(left_events_strip) > 0 else 0.0
-        right_events_strip_duration = t if len(right_events_strip) > 0 else 0.0
-        
-        left_target_time = left_events_strip_duration / 2.0
-        right_target_time = right_events_strip_duration / 2.0
-        left_pose = self.find_pose(poses, left_target_time)
-        right_pose = self.find_pose(poses, right_target_time)
+    def chunk_events(self, events, R = 1000, Np = 1024):
+        """
+        chunk events as per Ren et al. CVPR-2024
+        for j in len(E) do
+            Pi.append(ej→l); j = l; where tl - tj = R
+            if (len(Pi) > Np): i = i + 1;
+        """
 
-        return{
-            'left_events_strip': left_events_strip,
-            'right_events_strip': right_events_strip,
-            'left_pose': left_pose,
-            'right_pose': right_pose,
-            'left_events_strip_duration': left_events_strip_duration,
-            'right_events_strip_duration': right_events_strip_duration,
-            'sequence_info': {
-                'sequence': seq_info['sequence']
-            }
-        }
-    
+        if len(events) == 0:
+            return []
+        
+        packets = []
+        j = 0
+
+        while j < len(events):
+            t_start = events['t'][j]
+            l = j
+            while l < len(events) and (events['t'][l] - t_start) <= R:
+                l += 1
+
+            packet = events[j:l].copy()
+
+            if len(packet) > Np:
+                truncated_packet = packet[:Np].copy()
+                packets.append(truncated_packet)
+                j = j + Np # Move to the next unprocessed event without skipping any events
+
+            else:
+                if len(packet) > 0:
+                    packets.append(packet)
+                    j = l # move to the next time window in the same batch of events
+
+        return packets
+
+    def __getitem__(self, idx):
+        # Loads only one batch for the specified time
+
+        seq_idx, t_start, t_end = self.time_samples[idx]
+        seq_info = self.sequences[seq_idx]
+        left_events = self.get_events(seq_info['left_events_path'], t_start, t_end, seq_info['use_ms_idx'])
+        # right_events = self.get_events(seq_info['right_events_path'], t_start, t_end, seq_info['use_ms_idx'])
+
+        R = self.t # 1 ms time interval
+        Np = self.N
+
+        left_packets = self.chunk_events(left_events, R, Np)
+        # right_packets = self.chunk_events(right_events, R, Np)
+
+        all_samples = []
+
+        num_packets = len(left_packets)
+        # num_packets = min(len(left_packets), len(right_packets))
+
+        for i in range(num_packets):
+            left_chunk = left_packets[i]
+            # right_chunk = right_packets[i]
+
+            left_chunk = self.normalize_events(left_chunk, seq_info['width'], seq_info['height'])
+            # right_chunk = self.normalize_events(right_chunk, seq_info['width'], seq_info['height']
+
+            # Mid-time of this packet for pose lookup
+            mid_time = (t_start + t_end) / 2.0
+
+            left_pose = self.find_pose(seq_info['poses'], mid_time)
+            # right_pose = self.find_pose(seq_info['poses'], mid_time)
+
+            all_samples.append({
+                'left_events_strip': left_chunk,
+                # 'right_events_strip': right_events_chunk,
+                'left_pose': left_pose,
+                # 'right_pose': right_pose,
+                'left_events_strip_duration': 1.0 if len(left_chunk) > 0 else 0.0,
+                # 'right_events_strip_duration': 1.0 if len(right_chunk) > 0 else 0.0,
+                'left_packets_count': len(left_packets),
+                # 'right_packets_count': len(right_packets),
+                'sequence_info': {
+                    'sequence': seq_info['sequence'],
+                    'time_window': (t_start, t_end),
+                    'packet_index': i,
+                    'total_packets': num_packets
+                }
+            })
+
+        return all_samples
 def event_extractor(dataset_root, **kwargs):
     return EventExtractionDataset(dataset_root, **kwargs)
 
 if __name__ == "__main__":
     dataset_root = r"//media/adarsh/One Touch/EventSLAM/dataset/train"
     dataset = event_extractor(dataset_root)
-    print(f"found {len(dataset)} sequences")
-    sample = dataset[0]
-    print(len(sample['left_events_strip']))
-    for i in range(len(sample['left_events_strip'])):
-        print(sample['left_events_strip'][i])
+    print(f"found {len(dataset)} time samples")
+    
+    # Get the first time sample (which returns a list of packets)
+    packets = dataset[0]
+    print(f"Number of packets in first time sample: {len(packets)}")
+    
+    # Print details about each packet
+    for i, packet in enumerate(packets):
+        print(f"Packet {i}: {len(packet['left_events_strip'])} events")
+
+    if len(packets) > 0:
+        first_packet = packets[0]
+        print(f"\nFirst packet events shape: {first_packet['left_events_strip'].shape}")
+        print(f"First packet pose: {first_packet['left_pose']}")
+        print(f"Sequence info: {first_packet['sequence_info']}")
