@@ -26,13 +26,13 @@ def sample_and_mask_events(events, N = 1024):
 
     return sampled_events, mask
 
-def sample_and_mask(events, N = 1024):
+def sample_and_mask(events, N=1024):
     
     """
     This function exists to return a pytorch tensor for the sampled and masked events with a single call
     """
 
-    sampled_events, mask = sample_and_mask_events(events, N=1024)
+    sampled_events, mask = sample_and_mask_events(events, N)
     events_tensor = torch.from_numpy(sampled_events).float()
     mask_tensor = torch.from_numpy(mask).bool()
 
