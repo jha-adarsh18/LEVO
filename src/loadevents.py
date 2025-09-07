@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset
 
 class EventExtractionDataset(Dataset):
-    def __init__(self, dataset_root, width = None, height = None, t = 1000, N = 1024):
+    def __init__(self, dataset_root, width = None, height = None, t = 5000, N = 1024):
         self.width = width
         self.height = height
         self.t = t
@@ -144,7 +144,7 @@ class EventExtractionDataset(Dataset):
             else:
                 return pose_after[1:].astype(np.float32)
             
-    def chunk_events(self, events, R = 1000, Np = 1024):
+    def chunk_events(self, events, R = 5000, Np = 1024):
         """
         chunk events as per Ren et al. CVPR-2024
         for j in len(E) do
