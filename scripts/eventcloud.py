@@ -242,7 +242,7 @@ class HierarchyStructure(nn.Module):
         if points is not None:
             points_grouped = self.index_points(points, idx_expanded)
             points_grouped = points_grouped.view(B, -1, npoint, nsample)
-            grouped_points = torch.cat([grouped_xyz, points_grouped], dim=1)
+            grouped_points = points_grouped
         else:
             grouped_points = grouped_xyz
         
