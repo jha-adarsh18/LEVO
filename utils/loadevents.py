@@ -13,10 +13,10 @@ class EventExtractionDataset(Dataset):
         self.t = t
         self.N = N
         self.sequences = []
-        self.time_samples = []
+        self.flat_samples = []
         self.discover_sequences(dataset_root)
         self.cache_metadata()
-        self.generate_time_samples()
+        self.generate_flat_samples()
     
     def discover_sequences(self, dataset_root):
         for sequence in os.listdir(dataset_root):
@@ -64,18 +64,39 @@ class EventExtractionDataset(Dataset):
             poses = np.loadtxt(seq_info['pose_path'])
             seq_info['poses'] = poses
 
-    def generate_time_samples(self):
+    def generate_flat_samples(self):
+        print("Generating flat samples...")
         for seq_idx, seq_info in enumerate(self.sequences):
             t_start = seq_info['time_start']
             t_end = seq_info['time_end']
             current_time = t_start
+        
             while current_time < t_end:
                 window_end = min(current_time + self.t, t_end)
-                self.time_samples.append((seq_idx, current_time, window_end))
+                left_events = self.get_events(seq_info['left_events_path'], current_time, window_end, seq_info['use_ms_idx'])
+                left_packets = self.chunk_events(left_events, self.t, self.N)
+            
+                for packet in left_packets:
+                    if len(packet) == 0:  # Skip empty
+                        continue
+                
+                    packet = self.normalize_events(packet, seq_info['width'], seq_info['height'])
+                    mid_time = (current_time + window_end) / 2.0
+                    pose = self.find_pose(seq_info['poses'], mid_time)
+                
+                    self.flat_samples.append({
+                        'left_events_strip': packet,
+                        'left_pose': pose,
+                        'seq_idx': seq_idx,
+                        'sequence': seq_info['sequence']
+                    })
+            
                 current_time += self.t
+    
+        print(f"Generated {len(self.flat_samples)} valid packets")
 
     def __len__(self):
-        return len(self.time_samples)
+        return len(self.flat_samples)
     
     def get_events(self, file_path, t_start, t_end, use_ms_idx=True):
         with h5py.File(file_path, "r") as f:
@@ -181,44 +202,44 @@ class EventExtractionDataset(Dataset):
     def __getitem__(self, idx):
         # Loads only one batch for the specified time
 
-        seq_idx, t_start, t_end = self.time_samples[idx]
+        seq_idx, t_start, t_end = self.flat_samples[idx]
         seq_info = self.sequences[seq_idx]
         left_events = self.get_events(seq_info['left_events_path'], t_start, t_end, seq_info['use_ms_idx'])
-        # right_events = self.get_events(seq_info['right_events_path'], t_start, t_end, seq_info['use_ms_idx'])
+        right_events = self.get_events(seq_info['right_events_path'], t_start, t_end, seq_info['use_ms_idx'])
 
         R = self.t # 1 ms time interval
         Np = self.N
 
         left_packets = self.chunk_events(left_events, R, Np)
-        # right_packets = self.chunk_events(right_events, R, Np)
+        right_packets = self.chunk_events(right_events, R, Np)
 
         all_samples = []
 
-        num_packets = len(left_packets)
-        # num_packets = min(len(left_packets), len(right_packets))
+        # num_packets = len(left_packets)
+        num_packets = min(len(left_packets), len(right_packets))
 
         for i in range(num_packets):
             left_chunk = left_packets[i]
-            # right_chunk = right_packets[i]
+            right_chunk = right_packets[i]
 
             left_chunk = self.normalize_events(left_chunk, seq_info['width'], seq_info['height'])
-            # right_chunk = self.normalize_events(right_chunk, seq_info['width'], seq_info['height']
+            right_chunk = self.normalize_events(right_chunk, seq_info['width'], seq_info['height'])
 
             # Mid-time of this packet for pose lookup
             mid_time = (t_start + t_end) / 2.0
 
             left_pose = self.find_pose(seq_info['poses'], mid_time)
-            # right_pose = self.find_pose(seq_info['poses'], mid_time)
+            right_pose = self.find_pose(seq_info['poses'], mid_time)
 
             all_samples.append({
                 'left_events_strip': left_chunk,
-                # 'right_events_strip': right_events_chunk,
+                'right_events_strip': right_chunk,
                 'left_pose': left_pose,
-                # 'right_pose': right_pose,
+                'right_pose': right_pose,
                 'left_events_strip_duration': 1.0 if len(left_chunk) > 0 else 0.0,
-                # 'right_events_strip_duration': 1.0 if len(right_chunk) > 0 else 0.0,
+                'right_events_strip_duration': 1.0 if len(right_chunk) > 0 else 0.0,
                 'left_packets_count': len(left_packets),
-                # 'right_packets_count': len(right_packets),
+                'right_packets_count': len(right_packets),
                 'sequence_info': {
                     'sequence': seq_info['sequence'],
                     'time_window': (t_start, t_end),

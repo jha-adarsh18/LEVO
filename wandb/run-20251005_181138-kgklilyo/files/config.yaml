@@ -1,0 +1,42 @@
+_wandb:
+    value:
+        cli_version: 0.22.1
+        e:
+            tcpm6z70092lwb21sdbk7ssc8iykl2g7:
+                email: jhaadarsh350@gmail.com
+                executable: /home/adarsh/miniconda3/envs/pevslam/bin/python
+                git:
+                    commit: 83c43f278e2c1ce5dd77e1b2a77bc1a6c4e4bad7
+                    remote: git@github.com:jha-adarsh18/PEVSLAM.git
+                host: adarsh-ZenBook
+                os: Linux-6.14.0-32-generic-x86_64-with-glibc2.39
+                program: -m scripts.triplet_train
+                python: CPython 3.12.11
+                root: /home/adarsh/PEVSLAM
+                startedAt: "2025-10-05T12:41:38.548907Z"
+                writerId: tcpm6z70092lwb21sdbk7ssc8iykl2g7
+        m: []
+        python_version: 3.12.11
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 16
+            "4": 3.12.11
+            "5": 0.22.1
+            "12": 0.22.1
+            "13": linux-x86_64
+architecture:
+    value: PEVSLAM
+batch_size:
+    value: 8
+epochs:
+    value: 50
+learning_rate:
+    value: 0.001
+train_samples:
+    value: 901790
+val_samples:
+    value: 100199

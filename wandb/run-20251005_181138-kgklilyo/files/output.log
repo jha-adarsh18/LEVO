@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/adarsh/PEVSLAM/scripts/triplet_train.py", line 441, in <module>
+    train(
+  File "/home/adarsh/PEVSLAM/scripts/triplet_train.py", line 310, in train
+    wandb.watch(model, log="all", log_freq=100)
+                ^^^^^
+UnboundLocalError: cannot access local variable 'model' where it is not associated with a value
