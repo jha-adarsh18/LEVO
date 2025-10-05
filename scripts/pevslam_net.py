@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from eventcloud import HierarchyStructure
+from scripts.eventcloud import HierarchyStructure
 
 class FeaturePropagation(nn.Module):
     """

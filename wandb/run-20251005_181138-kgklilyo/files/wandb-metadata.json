@@ -1,0 +1,15 @@
+{
+  "os":  "Linux-6.14.0-32-generic-x86_64-with-glibc2.39",
+  "python":  "CPython 3.12.11",
+  "startedAt":  "2025-10-05T12:41:38.548907Z",
+  "program":  "-m scripts.triplet_train",
+  "git":  {
+    "remote":  "git@github.com:jha-adarsh18/PEVSLAM.git",
+    "commit":  "83c43f278e2c1ce5dd77e1b2a77bc1a6c4e4bad7"
+  },
+  "email":  "jhaadarsh350@gmail.com",
+  "root":  "/home/adarsh/PEVSLAM",
+  "host":  "adarsh-ZenBook",
+  "executable":  "/home/adarsh/miniconda3/envs/pevslam/bin/python",
+  "writerId":  "tcpm6z70092lwb21sdbk7ssc8iykl2g7"
+}
