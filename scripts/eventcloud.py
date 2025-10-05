@@ -18,7 +18,7 @@ To implement the following algorithm from Ren et al. CVPR 2024:
 17: end for
 """
 
-class HierarchyStructure(nn.module):
+class HierarchyStructure(nn.Module):
     def __init__(self, npoint, radius, nsample, in_channel, mlp,  group_all=False):
         super(HierarchyStructure, self).__init__()
         self.npoint = npoint
@@ -200,6 +200,51 @@ class HierarchyStructure(nn.module):
         return new_points
     
     def knn_group_masked(self, xyz, new_xyz, points, nsample, mask=None):
-        B, C, N = xyz.shape
+        B, C_xyz, N = xyz.shape
         npoint = new_xyz.shape[2]
+
+        # compute pairwise distances
+        xyz_expanded = xyz.unsqueeze(3) # [B, 3, N, 1]
+        new_xyz_expanded = new_xyz.unsqueeze(2) # [B, 3, 1, npoint]
+        dists = torch.sum((xyz_expanded - new_xyz_expanded) ** 2, dim=1) # [B, N, npoint]
+
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(2).expand(B, N, npoint)
+            dists = dists.masked_fill(~mask_expanded, float('inf'))
+
+        # find k nearest neighbors
+        dists = dists.permute(0, 2, 1) # [B, npoint, N]
+        _, idx = torch.topk(dists, nsample, dim=2, largest=False, sorted=True)
+
+        # handle insufficient valid neighbors
+        for b in range(B):
+            for p in range(npoint):
+                valid_mask = dists[b, p] != float('inf')
+                if valid_mask.sum() < nsample:
+                    idx[b, p, :] = 0
+                elif valid_mask.sum() <nsample:
+                    valid_idx = torch.where(valid_mask)[0]
+                    repeat_times = (nsample + len(valid_idx) - 1) // len(valid_idx)
+                    repeated_idx = valid_idx.repeat(repeat_times)[:nsample]
+                    idx[b, p, :] = repeated_idx
+
+        # gather grouped points            
+        idx_expanded = idx.view(B, npoint * nsample)
         
+        xyz_grouped = self.index_points(xyz, idx_expanded)
+        xyz_grouped = xyz_grouped.view(B, C_xyz, npoint, nsample)
+
+        # compute relative positions
+        new_xyz_expanded = new_xyz.unsqueeze(3).expand(B, C_xyz, npoint, nsample)
+        grouped_xyz = xyz_grouped - new_xyz_expanded
+
+        # index point features
+        if points is not None:
+            points_grouped = self.index_points(points, idx_expanded)
+            points_grouped = points_grouped.view(B, -1, npoint, nsample)
+            grouped_points = torch.cat([grouped_xyz, points_grouped], dim=1)
+        else:
+            grouped_points = grouped_xyz
+        
+        return grouped_xyz, grouped_points
+    
