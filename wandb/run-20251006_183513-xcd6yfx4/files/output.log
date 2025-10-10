@@ -1,0 +1,28 @@
+
+==================================================
+Epoch 1/50
+==================================================
+Epoch 1:   0%|                                                                                                                                | 0/112724 [00:00<?, ?it/s]/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/utils/data/dataloader.py:666: UserWarning: 'pin_memory' argument is set as true but no accelerator is found, then device pinned memory won't be used.
+  warnings.warn(warn_msg)
+Epoch 1:   0%|                                                                                    | 1/112724 [07:34<14223:54:16, 454.26s/it, loss=0.6003, triplet=0.4961]
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/adarsh/PEVSLAM/scripts/triplet_train.py", line 522, in <module>
+    train(
+  File "/home/adarsh/PEVSLAM/scripts/triplet_train.py", line 432, in train
+    train_loss = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/adarsh/PEVSLAM/scripts/triplet_train.py", line 288, in train_epoch
+    loss_dict['total'].backward()
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/_tensor.py", line 647, in backward
+    torch.autograd.backward(
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/autograd/__init__.py", line 354, in backward
+    _engine_run_backward(
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/autograd/graph.py", line 829, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/wandb/integration/torch/wandb_torch.py", line 276, in <lambda>
+    handle = var.register_hook(lambda grad: _callback(grad, log_track))
+
+KeyboardInterrupt
