@@ -5,6 +5,7 @@ import h5py
 import hdf5plugin
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 class EventExtractionDataset(Dataset):
     def __init__(self, dataset_root, width = None, height = None, t = 5000, N = 1024):
@@ -65,69 +66,63 @@ class EventExtractionDataset(Dataset):
             seq_info['poses'] = poses
 
     def generate_flat_samples(self):
+        """Generate lightweight time window indices instead of loading all data"""
         print("Generating flat samples...")
-        for seq_idx, seq_info in enumerate(self.sequences):
+        for seq_idx, seq_info in tqdm(enumerate(self.sequences), total=len(self.sequences), desc="Processing sequences"):
             t_start = seq_info['time_start']
             t_end = seq_info['time_end']
             current_time = t_start
         
             while current_time < t_end:
                 window_end = min(current_time + self.t, t_end)
-                left_events = self.get_events(seq_info['left_events_path'], current_time, window_end, seq_info['use_ms_idx'])
-                left_packets = self.chunk_events(left_events, self.t, self.N)
-            
-                for packet in left_packets:
-                    if len(packet) == 0:  # Skip empty
-                        continue
                 
-                    packet = self.normalize_events(packet, seq_info['width'], seq_info['height'])
-                    mid_time = (current_time + window_end) / 2.0
-                    pose = self.find_pose(seq_info['poses'], mid_time)
-                
-                    self.flat_samples.append({
-                        'left_events_strip': packet,
-                        'left_pose': pose,
-                        'seq_idx': seq_idx,
-                        'sequence': seq_info['sequence']
-                    })
-            
+                # Store only lightweight metadata, not actual events
+                self.flat_samples.append({
+                    'seq_idx': seq_idx,
+                    't_start': current_time,
+                    't_end': window_end
+                })
+        
                 current_time += self.t
-    
-        print(f"Generated {len(self.flat_samples)} valid packets")
+
+        print(f"Generated {len(self.flat_samples)} time windows")
 
     def __len__(self):
         return len(self.flat_samples)
     
     def get_events(self, file_path, t_start, t_end, use_ms_idx=True):
         with h5py.File(file_path, "r") as f:
-            if use_ms_idx and "ms_to_idx" in f:
-                ms_to_idx = f["ms_to_idx"]
-                ms_start =  int(t_start / 1000)
-                ms_end = int(t_end / 1000)
-                start_idx = ms_to_idx[ms_start] if ms_start < len(ms_to_idx) else len(f["events/t"]) -1
-                end_idx = ms_to_idx[ms_end] if ms_end < len(ms_to_idx) else len(f["events/t"])
-            
-            else:
-                # use binary search, mainly for MVSEC while training
-                start_idx = np.searchsorted(f["events/t"], t_start, side = "left")
-                end_idx = np.searchsorted(f["events/t"], t_end, side='right')
+            return self.get_events_from_file(f, t_start, t_end, use_ms_idx)
+    
+    def get_events_from_file(self, f, t_start, t_end, use_ms_idx=True):
+        if use_ms_idx and "ms_to_idx" in f:
+            ms_to_idx = f["ms_to_idx"]
+            ms_start =  int(t_start / 1000)
+            ms_end = int(t_end / 1000)
+            start_idx = ms_to_idx[ms_start] if ms_start < len(ms_to_idx) else len(f["events/t"]) -1
+            end_idx = ms_to_idx[ms_end] if ms_end < len(ms_to_idx) else len(f["events/t"])
+        
+        else:
+            # use binary search, mainly for MVSEC while training
+            start_idx = np.searchsorted(f["events/t"], t_start, side = "left")
+            end_idx = np.searchsorted(f["events/t"], t_end, side='right')
 
-            if start_idx > end_idx:
-                return np.array([], dtype = [('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
-            
-            x = f["events/x"][start_idx:end_idx]
-            y = f["events/y"][start_idx:end_idx]
-            t = f["events/t"][start_idx:end_idx]
-            p = f["events/p"][start_idx:end_idx]
+        if start_idx > end_idx:
+            return np.array([], dtype = [('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
+        
+        x = f["events/x"][start_idx:end_idx]
+        y = f["events/y"][start_idx:end_idx]
+        t = f["events/t"][start_idx:end_idx]
+        p = f["events/p"][start_idx:end_idx]
 
-            events = np.zeros(len(x), dtype=[('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
-            
-            events['x'] = x
-            events['y'] = y
-            events['t'] = t
-            events['p'] = p.astype(np.uint8)
+        events = np.zeros(len(x), dtype=[('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
+        
+        events['x'] = x
+        events['y'] = y
+        events['t'] = t
+        events['p'] = p.astype(np.uint8)
 
-            return events
+        return events
 
     def normalize_events(self, events, width, height):
         # Normalize events in the range [0, 1] locally for the batch
@@ -200,22 +195,26 @@ class EventExtractionDataset(Dataset):
         return packets
 
     def __getitem__(self, idx):
-        # Loads only one batch for the specified time
-
-        seq_idx, t_start, t_end = self.flat_samples[idx]
+        # Load events on-demand and create packets
+        sample_info = self.flat_samples[idx]
+        seq_idx = sample_info['seq_idx']
+        t_start = sample_info['t_start']
+        t_end = sample_info['t_end']
+        
         seq_info = self.sequences[seq_idx]
+        
+        # Lazy load events from H5 file
         left_events = self.get_events(seq_info['left_events_path'], t_start, t_end, seq_info['use_ms_idx'])
         right_events = self.get_events(seq_info['right_events_path'], t_start, t_end, seq_info['use_ms_idx'])
 
-        R = self.t # 1 ms time interval
+        R = self.t # time interval
         Np = self.N
 
+        # Chunk into 1024-event packets
         left_packets = self.chunk_events(left_events, R, Np)
         right_packets = self.chunk_events(right_events, R, Np)
 
         all_samples = []
-
-        # num_packets = len(left_packets)
         num_packets = min(len(left_packets), len(right_packets))
 
         for i in range(num_packets):
@@ -249,6 +248,7 @@ class EventExtractionDataset(Dataset):
             })
 
         return all_samples
+
 def event_extractor(dataset_root, **kwargs):
     return EventExtractionDataset(dataset_root, **kwargs)
 

@@ -29,75 +29,151 @@ class TripletEventDataset(Dataset):
         # build sequence index for efficient sampling
         self.sequence_packets = self.build_sequence_index()
 
+        # IMPORTANT: Filter flat_samples to only include valid indices
+        valid_indices = set()
+        for indices in self.sequence_packets.values():
+            valid_indices.update(indices)
+    
+        self.valid_indices = sorted(list(valid_indices))
+
     def build_sequence_index(self):
-        """Group packets by sequence for efficient triplet sampling"""
+        """Group packets by sequence for efficient sampling - metadata only"""
         sequence_packets = {}
-
-        for idx in range(len(self.base_dataset)):
-            sample = self.base_dataset.flat_samples[idx]
+    
+        # Use metadata from flat_samples directly, don't load events!
+        for idx, sample in enumerate(tqdm(self.base_dataset.flat_samples, desc="Building sequence index")):
             seq_idx = sample['seq_idx']
-
+        
             if seq_idx not in sequence_packets:
                 sequence_packets[seq_idx] = []
-
+        
             sequence_packets[seq_idx].append(idx)
-
+    
+        # Remove sequences with too few samples
+        min_samples = max(self.pos_range + 1, self.neg_theshold + 1)
+        sequence_packets = {
+            k: v for k, v in sequence_packets.items() 
+            if len(v) >= min_samples
+        }
+    
+        print(f"Built sequence index with {len(sequence_packets)} sequences")
         return sequence_packets
     
     def __len__(self):
-        return len(self.base_dataset)
+        return len(self.valid_indices)
     
     def __getitem__(self, idx):
-        anchor_packets = self.base_dataset[idx]
+        # Map to actual valid index
+        actual_idx = self.valid_indices[idx]
 
-        # find sequence and position
-        seq_idx, _, _ = self.base_dataset.time_samples[idx]
-        sequence_indices = self.sequence_packets[seq_idx]
-        anchor_position = sequence_indices.index(idx)
+        max_retries = 10  # Increase retries
+        for attempt in range(max_retries):
+            try:
+                anchor_packets = self.base_dataset[actual_idx]
 
-        # sample positive (temporal neighbor)
-        pos_offset = np.random.randint(1, self.pos_range + 1)
-        pos_idx_position = min(anchor_position + pos_offset, len(sequence_indices) - 1)
-        pos_idx = sequence_indices[pos_idx_position]
-        positive_packets = self.base_dataset[pos_idx]
+                # Check if we got valid packets
+                if len(anchor_packets) == 0:
+                    actual_idx = np.random.choice(self.valid_indices)
+                    continue
 
-        # sample negative (far away)
-        valid_negatives = [
-            sequence_indices[i] for i in range(len(sequence_indices))
-            if abs(i - anchor_position) >= self.neg_theshold
-        ]
+                # find sequence and position
+                seq_idx = self.base_dataset.flat_samples[actual_idx]['seq_idx']
+        
+                # Check if this sequence exists in our index
+                if seq_idx not in self.sequence_packets:
+                    actual_idx = np.random.choice(self.valid_indices)
+                    continue
+            
+                sequence_indices = self.sequence_packets[seq_idx]
+        
+                try:
+                    anchor_position = sequence_indices.index(actual_idx)
+                except ValueError:
+                    actual_idx = np.random.choice(self.valid_indices)
+                    continue
 
-        if len(valid_negatives) == 0:
-            # fallback: sample from different sequence
-            other_sequences = [s for s in self.sequence_packets.keys() if s != seq_idx]
-            if len(other_sequences) > 0:
-                other_seq = np.random.choice(other_sequences)
-                neg_idx = np.random.choice(self.sequence_packets[other_seq])
-            else:
-                neg_idx = idx # edge case: use anchor itself
-        else:
-            neg_idx = np.random.choice(valid_negatives)
+                # sample positive (temporal neighbor)
+                pos_offset = np.random.randint(1, self.pos_range + 1)
+                pos_idx_position = min(anchor_position + pos_offset, len(sequence_indices) - 1)
+                pos_idx = sequence_indices[pos_idx_position]
+                positive_packets = self.base_dataset[pos_idx]
 
-        negative_packets = self.base_dataset[neg_idx]
+                # sample negative (far away)
+                valid_negatives = [
+                    sequence_indices[i] for i in range(len(sequence_indices))
+                    if abs(i - anchor_position) >= self.neg_theshold
+                ]
 
-        # each packet list contains multiple event chunks, randomly select onoe from each
-        anchor = np.random.choice(anchor_packets)
-        positive = np.random.choice(positive_packets)
-        negative = np.random.choice(negative_packets)
+                if len(valid_negatives) == 0:
+                    other_sequences = [s for s in self.sequence_packets.keys() if s != seq_idx]
+                    if len(other_sequences) > 0:
+                        other_seq = np.random.choice(other_sequences)
+                        neg_idx = np.random.choice(self.sequence_packets[other_seq])
+                    else:
+                        neg_idx = actual_idx
+                else:
+                    neg_idx = np.random.choice(valid_negatives)
 
-        # extract events and sample/mask
-        anchor_events, anchor_mask = sample_and_mask(anchor['left_events_strip'], N=1024)
-        positive_events, positive_mask = sample_and_mask(positive['left_events_strip'], N=1204)
-        negative_events, negative_mask = sample_and_mask(negative['left_events_strip'], N=1024)
+                negative_packets = self.base_dataset[neg_idx]
 
-        return {
-            'anchor': anchor_events,
-            'anchor_mask': anchor_mask,
-            'positive': positive_events,
-            'positive_mask': positive_mask,
-            'negative': negative_events,
-            'negative_mask': negative_mask
-        }
+                # Check all packet lists are non-empty
+                if len(anchor_packets) == 0 or len(positive_packets) == 0 or len(negative_packets) == 0:
+                    actual_idx = np.random.choice(self.valid_indices)
+                    continue
+
+                # Randomly select one packet from each list
+                anchor = np.random.choice(anchor_packets)
+                positive = np.random.choice(positive_packets)
+                negative = np.random.choice(negative_packets)
+
+                # CRITICAL: Validate that the events exist and are non-empty
+                if ('left_events_strip' not in anchor or 
+                    'left_events_strip' not in positive or 
+                    'left_events_strip' not in negative):
+                    actual_idx = np.random.choice(self.valid_indices)
+                    continue
+
+                # Check event arrays are not empty
+                if (len(anchor['left_events_strip']) == 0 or 
+                    len(positive['left_events_strip']) == 0 or 
+                    len(negative['left_events_strip']) == 0):
+                    actual_idx = np.random.choice(self.valid_indices)
+                    continue
+
+                # Extract events and sample/mask
+                anchor_events, anchor_mask = sample_and_mask(anchor['left_events_strip'], N=1024)
+                positive_events, positive_mask = sample_and_mask(positive['left_events_strip'], N=1024)
+                negative_events, negative_mask = sample_and_mask(negative['left_events_strip'], N=1024)
+
+                # Final validation: ensure sample_and_mask returned valid data
+                if (anchor_events.shape[0] == 0 or 
+                    positive_events.shape[0] == 0 or 
+                    negative_events.shape[0] == 0):
+                    actual_idx = np.random.choice(self.valid_indices)
+                    continue
+
+                # Success! Return the triplet
+                return {
+                    'anchor': anchor_events,
+                    'anchor_mask': anchor_mask,
+                    'positive': positive_events,
+                    'positive_mask': positive_mask,
+                    'negative': negative_events,
+                    'negative_mask': negative_mask
+                }
+        
+            except Exception as e:
+                # Catch any unexpected errors and retry
+                print(f"Warning: Error in __getitem__ (attempt {attempt+1}/{max_retries}): {e}")
+                actual_idx = np.random.choice(self.valid_indices)
+                continue
+    
+        # After max_retries, raise error with detailed info
+        raise ValueError(
+            f"Could not find valid triplet after {max_retries} attempts. "
+            f"Last attempted index: {actual_idx}. "
+            f"This may indicate issues with your dataset or sample_and_mask function."
+        )
     
 class TripletLoss(nn.Module):
     """
@@ -284,18 +360,19 @@ def train(dataset_root, output_dir='./checkpoints', epochs=50, batch_size=8, lr=
     print("Loading dataset...")
     base_dataset = event_extractor(dataset_root)
 
+    # create triplet datasets
+    train_dataset = TripletEventDataset(base_dataset)
+    val_dataset = TripletEventDataset(base_dataset)
+
     # split into train/val (90/ 10 ) split
-    n_samples = len(base_dataset)
-    n_train = int(0.9 * n_samples)
-    indices = np.random.permutation(n_samples)
+    n_valid = len(train_dataset.valid_indices)
+    n_train = int(0.9 * n_valid)
+    indices = np.random.permutation(n_valid)
     train_indices = indices[:n_train]
     val_indices = indices[n_train:]
 
-    # create triplet datasets
-    train_dataset = TripletEventDataset(base_dataset)
     train_sampler = torch.utils.data.SubsetRandomSampler(train_indices)
 
-    val_dataset = TripletEventDataset(base_dataset)
     val_sampler = torch.utils.data.SubsetRandomSampler(val_indices)
 
     # Dataloaders

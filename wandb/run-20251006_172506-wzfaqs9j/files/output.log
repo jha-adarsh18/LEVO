@@ -1,0 +1,43 @@
+
+==================================================
+Epoch 1/50
+==================================================
+Epoch 1:   0%|                                                                                                                                | 0/112724 [00:00<?, ?it/s]/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/utils/data/dataloader.py:666: UserWarning: 'pin_memory' argument is set as true but no accelerator is found, then device pinned memory won't be used.
+  warnings.warn(warn_msg)
+Epoch 1:   0%|                                                                                                                                | 0/112724 [00:04<?, ?it/s]
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/adarsh/PEVSLAM/scripts/triplet_train.py", line 445, in <module>
+    train(
+  File "/home/adarsh/PEVSLAM/scripts/triplet_train.py", line 355, in train
+    train_loss = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/adarsh/PEVSLAM/scripts/triplet_train.py", line 193, in train_epoch
+    for batch in pbar:
+                 ^^^^
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/tqdm/std.py", line 1181, in __iter__
+    for obj in iterable:
+               ^^^^^^^^
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/utils/data/dataloader.py", line 734, in __next__
+    data = self._next_data()
+           ^^^^^^^^^^^^^^^^^
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/utils/data/dataloader.py", line 1516, in _next_data
+    return self._process_data(data, worker_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/utils/data/dataloader.py", line 1551, in _process_data
+    data.reraise()
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/_utils.py", line 769, in reraise
+    raise exception
+KeyError: Caught KeyError in DataLoader worker process 0.
+Original Traceback (most recent call last):
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/utils/data/_utils/worker.py", line 349, in _worker_loop
+    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/adarsh/miniconda3/envs/pevslam/lib/python3.12/site-packages/torch/utils/data/_utils/fetch.py", line 52, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+            ~~~~~~~~~~~~^^^^^
+  File "/home/adarsh/PEVSLAM/scripts/triplet_train.py", line 55, in __getitem__
+    sequence_indices = self.sequence_packets[seq_idx]
+                       ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+KeyError: 'seq_idx'
