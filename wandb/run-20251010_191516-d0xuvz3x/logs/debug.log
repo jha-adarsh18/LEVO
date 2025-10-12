@@ -1,0 +1,24 @@
+2025-10-10 19:15:16,218 INFO    MainThread:412217 [wandb_setup.py:_flush():81] Current SDK version is 0.22.1
+2025-10-10 19:15:16,218 INFO    MainThread:412217 [wandb_setup.py:_flush():81] Configure stats pid to 412217
+2025-10-10 19:15:16,219 INFO    MainThread:412217 [wandb_setup.py:_flush():81] Loading settings from /home/adarsh/.config/wandb/settings
+2025-10-10 19:15:16,219 INFO    MainThread:412217 [wandb_setup.py:_flush():81] Loading settings from /home/adarsh/PEVSLAM/wandb/settings
+2025-10-10 19:15:16,219 INFO    MainThread:412217 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2025-10-10 19:15:16,219 INFO    MainThread:412217 [wandb_init.py:setup_run_log_directory():705] Logging user logs to /home/adarsh/PEVSLAM/wandb/run-20251010_191516-d0xuvz3x/logs/debug.log
+2025-10-10 19:15:16,219 INFO    MainThread:412217 [wandb_init.py:setup_run_log_directory():706] Logging internal logs to /home/adarsh/PEVSLAM/wandb/run-20251010_191516-d0xuvz3x/logs/debug-internal.log
+2025-10-10 19:15:16,219 INFO    MainThread:412217 [wandb_init.py:init():832] calling init triggers
+2025-10-10 19:15:16,219 INFO    MainThread:412217 [wandb_init.py:init():837] wandb.init called with sweep_config: {}
+config: {'epochs': 50, 'batch_size': 8, 'learning_rate': 0.001, 'architecture': 'PEVSLAM', 'train_samples': 901790, 'val_samples': 100199, '_wandb': {}}
+2025-10-10 19:15:16,219 INFO    MainThread:412217 [wandb_init.py:init():880] starting backend
+2025-10-10 19:15:16,437 INFO    MainThread:412217 [wandb_init.py:init():883] sending inform_init request
+2025-10-10 19:15:16,447 INFO    MainThread:412217 [wandb_init.py:init():891] backend started and connected
+2025-10-10 19:15:16,449 INFO    MainThread:412217 [wandb_init.py:init():961] updated telemetry
+2025-10-10 19:15:16,455 INFO    MainThread:412217 [wandb_init.py:init():985] communicating run to backend with 90.0 second timeout
+2025-10-10 19:15:17,548 INFO    MainThread:412217 [wandb_init.py:init():1036] starting run threads in backend
+2025-10-10 19:15:17,693 INFO    MainThread:412217 [wandb_run.py:_console_start():2506] atexit reg
+2025-10-10 19:15:17,693 INFO    MainThread:412217 [wandb_run.py:_redirect():2354] redirect: wrap_raw
+2025-10-10 19:15:17,693 INFO    MainThread:412217 [wandb_run.py:_redirect():2423] Wrapping output streams.
+2025-10-10 19:15:17,693 INFO    MainThread:412217 [wandb_run.py:_redirect():2446] Redirects installed.
+2025-10-10 19:15:17,697 INFO    MainThread:412217 [wandb_init.py:init():1076] run started, returning control to user process
+2025-10-10 19:15:17,698 INFO    MainThread:412217 [wandb_watch.py:_watch():68] Watching
+2025-10-10 19:15:24,074 INFO    wandb-AsyncioManager-main:412217 [service_client.py:_forward_responses():80] Reached EOF.
+2025-10-10 19:15:24,075 INFO    wandb-AsyncioManager-main:412217 [mailbox.py:close():137] Closing mailbox, abandoning 1 handles.
