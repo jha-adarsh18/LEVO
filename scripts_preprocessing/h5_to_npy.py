@@ -5,303 +5,245 @@ import argparse
 from multiprocessing import Pool, cpu_count
 import time
 from glob import glob
+import h5py
+import hdf5plugin
 
-from utils.loadevents import event_extractor
-
-# Global variable for worker processes
 _worker_datasets = None
 _h5_files = None
 
 def init_worker(dataset_root):
-    """Initialize each worker with connections to all left_events.h5 files"""
     global _worker_datasets, _h5_files
+    h5_files = []
+    for pattern in ["*/*events_left.h5", "*/*-events_left.h5", "*/left_events.h5"]:
+        h5_files.extend(glob(os.path.join(dataset_root, pattern)))
+    _h5_files = sorted(list(set(h5_files)))
     
-    # Find all left_events.h5 files across sequences
-    _h5_files = sorted(glob(os.path.join(dataset_root, "*/left_events.h5")))
-    if not _h5_files:
-        raise FileNotFoundError(f"No left_events.h5 files found in {dataset_root}/*/")
-    
-    # Open all datasets once per worker
-    _worker_datasets = {
-        h5_path: event_extractor(h5_path) 
-        for h5_path in _h5_files
-    }
+    # Keep H5 files open for entire worker lifetime
+    _worker_datasets = {h5_path: h5py.File(h5_path, 'r') for h5_path in _h5_files}
+    print(f"Worker initialized with {len(_h5_files)} H5 files")
 
 def get_dataset_type(seq_name):
-    """Determine if sequence is MVSEC or TUM-VIE based on name"""
     seq_lower = seq_name.lower()
-    if 'indoor' in seq_lower or 'outdoor' in seq_lower:
+    # MVSEC has indoor_* and outdoor_* (including typos like "ourdoor")
+    if 'indoor' in seq_lower or 'outdoor' in seq_lower or 'ourdoor' in seq_lower:
         return 'mvsec'
-    else:
-        return 'tum'
+    return 'tum'
 
-def save_sample_worker(args):
-    """Worker function - load from appropriate HDF5 file based on index"""
-    file_idx, sample_idx, output_dir, seq_prefix = args
+def get_events_from_h5(h5file, t_start, t_end, use_ms_idx=True):
+    if use_ms_idx and "ms_to_idx" in h5file:
+        ms_to_idx = h5file["ms_to_idx"][:]
+        ms_start = int(t_start / 1000)
+        ms_end = int(t_end / 1000)
+        start_idx = int(ms_to_idx[ms_start]) if ms_start < len(ms_to_idx) else len(h5file["events/t"]) - 1
+        end_idx = int(ms_to_idx[ms_end]) if ms_end < len(ms_to_idx) else len(h5file["events/t"])
+    else:
+        t_data = h5file["events/t"]
+        start_idx = np.searchsorted(t_data, t_start, side="left")
+        end_idx = np.searchsorted(t_data, t_end, side='right')
+
+    if start_idx >= end_idx:
+        return np.array([], dtype=[('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
+    
+    x = np.array(h5file["events/x"][start_idx:end_idx])
+    y = np.array(h5file["events/y"][start_idx:end_idx])
+    t = np.array(h5file["events/t"][start_idx:end_idx])
+    p = np.array(h5file["events/p"][start_idx:end_idx])
+
+    events = np.zeros(len(x), dtype=[('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
+    events['x'] = x
+    events['y'] = y
+    events['t'] = t
+    events['p'] = p.astype(np.uint8)
+    return events
+
+def chunk_events(events, Np=1024):
+    if len(events) == 0:
+        return []
+    
+    # Simple chunking: split into Np-sized packets
+    packets = []
+    for i in range(0, len(events), Np):
+        packet = events[i:i+Np]
+        if len(packet) > 0:
+            packets.append(packet)
+    return packets
+
+def save_packets_worker(args):
+    file_idx, window_batch, output_dir, seq_prefix, use_ms_idx = args
     
     try:
         h5_path = _h5_files[file_idx]
-        dataset = _worker_datasets[h5_path]
+        h5file = _worker_datasets[h5_path]
         
-        sample = dataset[sample_idx]
-        events = sample['left_events_strip']
-        seq_info = sample['sequence_info']
+        packets_saved = 0
+        total_events = 0
         
-        # Use the pre-computed prefix for naming
-        output_path = os.path.join(output_dir, f'{seq_prefix}_s{sample_idx:08d}.npz')
-        np.savez_compressed(
-            output_path,
-            events=events,
-            sequence=seq_info['sequence'],
-            time_window=seq_info['time_window']
-        )
+        for window_idx, (t_start, t_end) in window_batch:
+            events = get_events_from_h5(h5file, t_start, t_end, use_ms_idx)
+            if len(events) == 0:
+                continue
+            
+            # Chunk into 1024-event packets
+            packets = chunk_events(events, Np=1024)
+            
+            for packet_idx, packet in enumerate(packets):
+                output_path = os.path.join(
+                    output_dir, 
+                    f'{seq_prefix}_w{window_idx:06d}_p{packet_idx:03d}.npz'
+                )
+                np.savez_compressed(
+                    output_path,
+                    events=packet,
+                    time_window=np.array([t_start, t_end]),
+                    time_mid=(t_start + t_end) / 2.0,
+                    sequence=seq_prefix
+                )
+                packets_saved += 1
+                total_events += len(packet)
         
-        return file_idx, sample_idx, True, None
+        return file_idx, True, None, packets_saved, total_events
     except Exception as e:
-        return file_idx, sample_idx, False, str(e)
+        return file_idx, False, str(e), 0, 0
 
-def get_dataset_info(dataset_root):
-    """Get info about all left_events.h5 files and their sample counts"""
-    h5_files = sorted(glob(os.path.join(dataset_root, "*/left_events.h5")))
+def get_dataset_info(dataset_root, time_window_us=5000, stride_us=None, sample_rate=1):
+    if stride_us is None:
+        stride_us = time_window_us
+    
+    h5_files = []
+    for pattern in ["*/*events_left.h5", "*/*-events_left.h5", "*/left_events.h5"]:
+        h5_files.extend(glob(os.path.join(dataset_root, pattern)))
+    h5_files = sorted(list(set(h5_files)))
     
     if not h5_files:
-        raise FileNotFoundError(f"No left_events.h5 files found in {dataset_root}/*/")
+        raise FileNotFoundError(f"No left events HDF5 files found in {dataset_root}/")
     
-    print(f"\n📂 Found {len(h5_files)} sequences with left_events.h5")
+    print(f"Found {len(h5_files)} H5 files")
     
     file_info = []
-    total_samples = 0
-    
-    # Track sequence counters for each dataset type
     mvsec_counter = 0
     tum_counter = 0
     
     for h5_path in h5_files:
-        seq_name = os.path.basename(os.path.dirname(h5_path))
+        parent_dir = os.path.basename(os.path.dirname(h5_path))
+        seq_name = parent_dir
         dataset_type = get_dataset_type(seq_name)
         
-        # Assign sequential numbering based on type
         if dataset_type == 'mvsec':
             seq_prefix = f'mvsec_seq{mvsec_counter:02d}'
+            use_ms_idx = False
             mvsec_counter += 1
         else:
             seq_prefix = f'tum_seq{tum_counter:02d}'
+            use_ms_idx = True
             tum_counter += 1
         
-        dataset = event_extractor(h5_path)
-        num_samples = len(dataset)
+        with h5py.File(h5_path, 'r') as h5file:
+            time_start = float(h5file["events/t"][0])
+            time_end = float(h5file["events/t"][-1])
+        
+        # Sample windows if sample_rate < 1
+        time_windows = []
+        current_time = time_start
+        window_counter = 0
+        while current_time < time_end:
+            window_end = min(current_time + time_window_us, time_end)
+            if sample_rate >= 1 or (window_counter % int(1/sample_rate)) == 0:
+                time_windows.append((current_time, window_end))
+            current_time += stride_us
+            window_counter += 1
         
         file_info.append({
             'path': h5_path,
             'sequence': seq_name,
             'dataset_type': dataset_type,
             'seq_prefix': seq_prefix,
-            'num_samples': num_samples
+            'use_ms_idx': use_ms_idx,
+            'time_windows': time_windows,
+            'time_start': time_start,
+            'time_end': time_end
         })
-        total_samples += num_samples
-        del dataset
+        
+        print(f"  {seq_prefix}: {seq_name} - {len(time_windows)} windows")
     
-    return file_info, total_samples
+    return file_info
 
-def convert_parallel(dataset_root, output_dir, num_workers=None, max_samples=None, chunksize=10):
-    """
-    Convert left_events.h5 from all sequences to NPZ format using parallel processing
-    
-    Args:
-        dataset_root: Path containing sequence folders (e.g., /workspace/train-split)
-        output_dir: Directory to save NPZ files
-        num_workers: Number of parallel workers (default: CPU count - 2)
-        max_samples: Limit conversion to first N samples across all sequences
-        chunksize: Number of samples per task (default: 10)
-    """
+def convert_parallel(dataset_root, output_dir, num_workers=None, 
+                     time_window_us=5000, stride_us=None, max_sequences=None, 
+                     batch_size=100, sample_rate=1.0):
     
     os.makedirs(output_dir, exist_ok=True)
-    
     if num_workers is None:
-        # For 8 available CPUs, use 6 workers
         num_workers = max(1, cpu_count() - 2)
     
-    print("\n" + "="*70)
-    print("🚀 Left Events HDF5 → NPZ Converter")
-    print("="*70)
-    print(f"Dataset root: {dataset_root}")
-    print(f"Output directory: {output_dir}")
-    print(f"Workers: {num_workers}")
-    print(f"Chunksize: {chunksize}")
+    print(f"\nDataset: {dataset_root}")
+    print(f"Output: {output_dir}")
+    print(f"Workers: {num_workers}, Batch: {batch_size} windows/task")
+    if sample_rate < 1.0:
+        print(f"Sampling: {sample_rate*100:.1f}% of windows\n")
+    else:
+        print()
     
-    # Get info about all left_events.h5 files
-    print("\n📂 Scanning sequences...")
-    file_info, total_samples = get_dataset_info(dataset_root)
-    
-    # Display sequence information grouped by type
-    print("\n" + "="*70)
-    print("📊 Sequence Information")
-    print("="*70)
+    file_info = get_dataset_info(dataset_root, time_window_us, stride_us, sample_rate)
+    if max_sequences:
+        file_info = file_info[:max_sequences]
     
     mvsec_seqs = [f for f in file_info if f['dataset_type'] == 'mvsec']
     tum_seqs = [f for f in file_info if f['dataset_type'] == 'tum']
     
-    if mvsec_seqs:
-        print("\n🎥 MVSEC Sequences:")
-        for info in mvsec_seqs:
-            print(f"  {info['seq_prefix']:12s} <- {info['sequence']:30s} ({info['num_samples']:,} samples)")
+    print(f"\nMVSEC: {len(mvsec_seqs)}, TUM-VIE: {len(tum_seqs)}")
+    total_windows = sum(len(info['time_windows']) for info in file_info)
+    print(f"Total windows: {total_windows:,}\n")
     
-    if tum_seqs:
-        print("\n🎥 TUM-VIE Sequences:")
-        for info in tum_seqs:
-            print(f"  {info['seq_prefix']:12s} <- {info['sequence']:30s} ({info['num_samples']:,} samples)")
-    
-    if max_samples is not None:
-        total_samples = min(total_samples, max_samples)
-    
-    print("\n" + "="*70)
-    print(f"📊 Total samples to convert: {total_samples:,}")
-    print("="*70)
-    
-    # Build worker arguments: (file_idx, sample_idx, output_dir, seq_prefix)
-    print("\n⚙️  Preparing worker arguments...")
+    # Split windows into batches
     worker_args = []
-    samples_added = 0
-    
     for file_idx, info in enumerate(file_info):
-        for sample_idx in range(info['num_samples']):
-            if max_samples and samples_added >= max_samples:
-                break
-            worker_args.append((file_idx, sample_idx, output_dir, info['seq_prefix']))
-            samples_added += 1
-        
-        if max_samples and samples_added >= max_samples:
-            break
+        windows = [(i, w) for i, w in enumerate(info['time_windows'])]
+        for i in range(0, len(windows), batch_size):
+            batch = windows[i:i+batch_size]
+            worker_args.append((file_idx, batch, output_dir, info['seq_prefix'], info['use_ms_idx']))
     
-    # Process in parallel
-    print(f"\n🔄 Converting left_events.h5 samples...")
-    print(f"⚡ Each worker opens {len(file_info)} files ONCE (very efficient!)")
-    print(f"⚡ Using chunksize={chunksize} for optimal throughput")
+    print(f"Created {len(worker_args)} tasks\n")
+    
     start_time = time.time()
-    
-    failed_samples = []
+    total_packets = 0
+    total_events = 0
     
     with Pool(processes=num_workers, initializer=init_worker, initargs=(dataset_root,)) as pool:
-        results = list(tqdm(
-            pool.imap_unordered(save_sample_worker, worker_args, chunksize=chunksize),
+        for file_idx, success, error, packets_saved, events_count in tqdm(
+            pool.imap_unordered(save_packets_worker, worker_args),
             total=len(worker_args),
             desc="Converting",
-            unit="samples",
-            smoothing=0.1
-        ))
-    
-    # Check for failures
-    for file_idx, sample_idx, success, error in results:
-        if not success:
-            failed_samples.append((file_idx, sample_idx, error))
+            unit="batch"
+        ):
+            if success:
+                total_packets += packets_saved
+                total_events += events_count
     
     elapsed_time = time.time() - start_time
     
-    # Summary
-    print("\n" + "="*70)
-    print("✅ Conversion Complete!")
-    print("="*70)
-    print(f"Sequences processed: {len(file_info)}")
-    print(f"  - MVSEC: {len(mvsec_seqs)}")
-    print(f"  - TUM-VIE: {len(tum_seqs)}")
-    print(f"Total samples: {len(worker_args):,}")
-    print(f"Successful: {len(worker_args) - len(failed_samples):,}")
-    print(f"Failed: {len(failed_samples)}")
-    print(f"Time elapsed: {elapsed_time/60:.1f} minutes ({elapsed_time:.1f} seconds)")
-    print(f"Average speed: {len(worker_args)/elapsed_time:.1f} samples/sec")
+    print(f"\n{'='*60}")
+    print(f"Packets: {total_packets:,}")
+    print(f"Events: {total_events:,}")
+    print(f"Time: {elapsed_time/60:.1f} min ({total_packets/elapsed_time:.0f} packets/sec)")
     
-    # Calculate disk usage
-    try:
-        npz_files = [f for f in os.listdir(output_dir) if f.endswith('.npz') and not f.startswith('conversion_')]
-        total_size = sum(
-            os.path.getsize(os.path.join(output_dir, f))
-            for f in npz_files
-        )
-        print(f"Total disk usage: {total_size / (1024**3):.2f} GB")
-        print(f"Average file size: {total_size / len(npz_files) / 1024:.2f} KB")
-    except Exception as e:
-        print(f"Could not calculate disk usage: {e}")
-    
-    if failed_samples:
-        print(f"\n⚠️  Failed samples: {len(failed_samples)}")
-        print("First 5 failures:")
-        for file_idx, sample_idx, error in failed_samples[:5]:
-            seq_info = file_info[file_idx]
-            print(f"  {seq_info['seq_prefix']} (sample {sample_idx}): {error}")
-    
-    print("="*70)
-    
-    # Save metadata
-    metadata_path = os.path.join(output_dir, 'conversion_metadata.npz')
-    np.savez(
-        metadata_path,
-        total_samples=len(worker_args),
-        successful_samples=len(worker_args) - len(failed_samples),
-        failed_indices=[(f, s) for f, s, _ in failed_samples],
-        conversion_time=elapsed_time,
-        num_sequences=len(file_info),
-        sequences=[info['seq_prefix'] for info in file_info],
-        original_names=[info['sequence'] for info in file_info],
-        dataset_types=[info['dataset_type'] for info in file_info]
-    )
-    print(f"\n💾 Metadata saved to: {metadata_path}")
-    
-    # Save detailed sequence mapping
-    mapping_path = os.path.join(output_dir, 'sequence_mapping.txt')
-    with open(mapping_path, 'w') as f:
-        f.write("Sequence Name Mapping\n")
-        f.write("="*70 + "\n\n")
-        f.write("MVSEC Sequences:\n")
-        for info in mvsec_seqs:
-            f.write(f"  {info['seq_prefix']:12s} <- {info['sequence']}\n")
-        f.write("\nTUM-VIE Sequences:\n")
-        for info in tum_seqs:
-            f.write(f"  {info['seq_prefix']:12s} <- {info['sequence']}\n")
-    print(f"💾 Sequence mapping saved to: {mapping_path}")
+    npz_files = [f for f in os.listdir(output_dir) if f.endswith('.npz')]
+    total_size = sum(os.path.getsize(os.path.join(output_dir, f)) for f in npz_files)
+    print(f"Disk: {total_size / (1024**3):.2f} GB ({total_size/len(npz_files)/1024:.1f} KB/packet)")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert left_events.h5 from all sequences to NPZ format")
-    
-    parser.add_argument(
-        "--dataset",
-        "-d",
-        required=True,
-        type=str,
-        help="Path to root directory containing sequence folders (e.g., /workspace/train-split)"
-    )
-    
-    parser.add_argument(
-        "--output",
-        "-o",
-        required=True,
-        type=str,
-        help="Output directory for NPZ files"
-    )
-    
-    parser.add_argument(
-        "--workers",
-        "-w",
-        type=int,
-        default=None,
-        help="Number of parallel workers (default: CPU count - 2, suggested: 6 for your 8-core setup)"
-    )
-    
-    parser.add_argument(
-        "--max-samples",
-        "-n",
-        type=int,
-        default=None,
-        help="Limit conversion to first N samples (default: all)"
-    )
-    
-    parser.add_argument(
-        "--chunksize",
-        "-c",
-        type=int,
-        default=10,
-        help="Number of samples per task (default: 10, try 20-50 for faster processing)"
-    )
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", "-d", required=True)
+    parser.add_argument("--output", "-o", required=True)
+    parser.add_argument("--workers", "-w", type=int, default=None)
+    parser.add_argument("--time-window", "-t", type=int, default=5000)
+    parser.add_argument("--stride", "-s", type=int, default=None)
+    parser.add_argument("--max-sequences", "-m", type=int, default=None)
+    parser.add_argument("--batch-size", "-b", type=int, default=100)
+    parser.add_argument("--sample-rate", "-r", type=float, default=1.0,
+                       help="Sample rate (0.1 = 10%% of windows, 1.0 = all)")
     args = parser.parse_args()
     
-    convert_parallel(args.dataset, args.output, args.workers, args.max_samples, args.chunksize)
+    convert_parallel(args.dataset, args.output, args.workers, 
+                    args.time_window, args.stride, args.max_sequences, 
+                    args.batch_size, args.sample_rate)
