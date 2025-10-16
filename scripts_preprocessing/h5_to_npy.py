@@ -27,9 +27,17 @@ def init_worker(dataset_root):
         for h5_path in _h5_files
     }
 
+def get_dataset_type(seq_name):
+    """Determine if sequence is MVSEC or TUM-VIE based on name"""
+    seq_lower = seq_name.lower()
+    if 'indoor' in seq_lower or 'outdoor' in seq_lower:
+        return 'mvsec'
+    else:
+        return 'tum'
+
 def save_sample_worker(args):
     """Worker function - load from appropriate HDF5 file based on index"""
-    file_idx, sample_idx, output_dir = args
+    file_idx, sample_idx, output_dir, seq_prefix = args
     
     try:
         h5_path = _h5_files[file_idx]
@@ -39,11 +47,8 @@ def save_sample_worker(args):
         events = sample['left_events_strip']
         seq_info = sample['sequence_info']
         
-        # Extract sequence name from path for better organization
-        seq_name = os.path.basename(os.path.dirname(h5_path))
-        
-        # Unique naming: includes sequence name and indices
-        output_path = os.path.join(output_dir, f'{seq_name}_f{file_idx:02d}_s{sample_idx:08d}.npz')
+        # Use the pre-computed prefix for naming
+        output_path = os.path.join(output_dir, f'{seq_prefix}_s{sample_idx:08d}.npz')
         np.savez_compressed(
             output_path,
             events=events,
@@ -62,18 +67,35 @@ def get_dataset_info(dataset_root):
     if not h5_files:
         raise FileNotFoundError(f"No left_events.h5 files found in {dataset_root}/*/")
     
-    print(f"Found {len(h5_files)} sequences with left_events.h5")
+    print(f"\n📂 Found {len(h5_files)} sequences with left_events.h5")
     
     file_info = []
     total_samples = 0
     
+    # Track sequence counters for each dataset type
+    mvsec_counter = 0
+    tum_counter = 0
+    
     for h5_path in h5_files:
         seq_name = os.path.basename(os.path.dirname(h5_path))
+        dataset_type = get_dataset_type(seq_name)
+        
+        # Assign sequential numbering based on type
+        if dataset_type == 'mvsec':
+            seq_prefix = f'mvsec_seq{mvsec_counter:02d}'
+            mvsec_counter += 1
+        else:
+            seq_prefix = f'tum_seq{tum_counter:02d}'
+            tum_counter += 1
+        
         dataset = event_extractor(h5_path)
         num_samples = len(dataset)
+        
         file_info.append({
             'path': h5_path,
             'sequence': seq_name,
+            'dataset_type': dataset_type,
+            'seq_prefix': seq_prefix,
             'num_samples': num_samples
         })
         total_samples += num_samples
@@ -83,11 +105,11 @@ def get_dataset_info(dataset_root):
 
 def convert_parallel(dataset_root, output_dir, num_workers=None, max_samples=None, chunksize=10):
     """
-    Convert left_events.h5 from all sequences to NPY format using parallel processing
+    Convert left_events.h5 from all sequences to NPZ format using parallel processing
     
     Args:
-        dataset_root: Path containing sequence folders
-        output_dir: Directory to save NPY files
+        dataset_root: Path containing sequence folders (e.g., /workspace/train-split)
+        output_dir: Directory to save NPZ files
         num_workers: Number of parallel workers (default: CPU count - 2)
         max_samples: Limit conversion to first N samples across all sequences
         chunksize: Number of samples per task (default: 10)
@@ -96,24 +118,47 @@ def convert_parallel(dataset_root, output_dir, num_workers=None, max_samples=Non
     os.makedirs(output_dir, exist_ok=True)
     
     if num_workers is None:
+        # For 8 available CPUs, use 6 workers
         num_workers = max(1, cpu_count() - 2)
     
-    print(f"🚀 Starting conversion with {num_workers} workers")
+    print("\n" + "="*70)
+    print("🚀 Left Events HDF5 → NPZ Converter")
+    print("="*70)
+    print(f"Dataset root: {dataset_root}")
     print(f"Output directory: {output_dir}")
+    print(f"Workers: {num_workers}")
+    print(f"Chunksize: {chunksize}")
     
     # Get info about all left_events.h5 files
-    print("\n📂 Scanning sequences for left_events.h5...")
+    print("\n📂 Scanning sequences...")
     file_info, total_samples = get_dataset_info(dataset_root)
     
-    for info in file_info:
-        print(f"  📄 {info['sequence']}: {info['num_samples']:,} samples")
+    # Display sequence information grouped by type
+    print("\n" + "="*70)
+    print("📊 Sequence Information")
+    print("="*70)
+    
+    mvsec_seqs = [f for f in file_info if f['dataset_type'] == 'mvsec']
+    tum_seqs = [f for f in file_info if f['dataset_type'] == 'tum']
+    
+    if mvsec_seqs:
+        print("\n🎥 MVSEC Sequences:")
+        for info in mvsec_seqs:
+            print(f"  {info['seq_prefix']:12s} <- {info['sequence']:30s} ({info['num_samples']:,} samples)")
+    
+    if tum_seqs:
+        print("\n🎥 TUM-VIE Sequences:")
+        for info in tum_seqs:
+            print(f"  {info['seq_prefix']:12s} <- {info['sequence']:30s} ({info['num_samples']:,} samples)")
     
     if max_samples is not None:
         total_samples = min(total_samples, max_samples)
     
-    print(f"\n📊 Total samples to convert: {total_samples:,}")
+    print("\n" + "="*70)
+    print(f"📊 Total samples to convert: {total_samples:,}")
+    print("="*70)
     
-    # Build worker arguments: (file_idx, sample_idx, output_dir)
+    # Build worker arguments: (file_idx, sample_idx, output_dir, seq_prefix)
     print("\n⚙️  Preparing worker arguments...")
     worker_args = []
     samples_added = 0
@@ -122,7 +167,7 @@ def convert_parallel(dataset_root, output_dir, num_workers=None, max_samples=Non
         for sample_idx in range(info['num_samples']):
             if max_samples and samples_added >= max_samples:
                 break
-            worker_args.append((file_idx, sample_idx, output_dir))
+            worker_args.append((file_idx, sample_idx, output_dir, info['seq_prefix']))
             samples_added += 1
         
         if max_samples and samples_added >= max_samples:
@@ -153,10 +198,12 @@ def convert_parallel(dataset_root, output_dir, num_workers=None, max_samples=Non
     elapsed_time = time.time() - start_time
     
     # Summary
-    print("\n" + "="*60)
+    print("\n" + "="*70)
     print("✅ Conversion Complete!")
-    print("="*60)
+    print("="*70)
     print(f"Sequences processed: {len(file_info)}")
+    print(f"  - MVSEC: {len(mvsec_seqs)}")
+    print(f"  - TUM-VIE: {len(tum_seqs)}")
     print(f"Total samples: {len(worker_args):,}")
     print(f"Successful: {len(worker_args) - len(failed_samples):,}")
     print(f"Failed: {len(failed_samples)}")
@@ -165,23 +212,24 @@ def convert_parallel(dataset_root, output_dir, num_workers=None, max_samples=Non
     
     # Calculate disk usage
     try:
+        npz_files = [f for f in os.listdir(output_dir) if f.endswith('.npz') and not f.startswith('conversion_')]
         total_size = sum(
             os.path.getsize(os.path.join(output_dir, f))
-            for f in os.listdir(output_dir)
-            if f.endswith('.npz')
+            for f in npz_files
         )
         print(f"Total disk usage: {total_size / (1024**3):.2f} GB")
-    except:
-        pass
+        print(f"Average file size: {total_size / len(npz_files) / 1024:.2f} KB")
+    except Exception as e:
+        print(f"Could not calculate disk usage: {e}")
     
     if failed_samples:
         print(f"\n⚠️  Failed samples: {len(failed_samples)}")
         print("First 5 failures:")
         for file_idx, sample_idx, error in failed_samples[:5]:
-            seq_name = file_info[file_idx]['sequence']
-            print(f"  {seq_name} - Sample {sample_idx}: {error}")
+            seq_info = file_info[file_idx]
+            print(f"  {seq_info['seq_prefix']} (sample {sample_idx}): {error}")
     
-    print("="*60)
+    print("="*70)
     
     # Save metadata
     metadata_path = os.path.join(output_dir, 'conversion_metadata.npz')
@@ -192,19 +240,34 @@ def convert_parallel(dataset_root, output_dir, num_workers=None, max_samples=Non
         failed_indices=[(f, s) for f, s, _ in failed_samples],
         conversion_time=elapsed_time,
         num_sequences=len(file_info),
-        sequences=[info['sequence'] for info in file_info]
+        sequences=[info['seq_prefix'] for info in file_info],
+        original_names=[info['sequence'] for info in file_info],
+        dataset_types=[info['dataset_type'] for info in file_info]
     )
     print(f"\n💾 Metadata saved to: {metadata_path}")
+    
+    # Save detailed sequence mapping
+    mapping_path = os.path.join(output_dir, 'sequence_mapping.txt')
+    with open(mapping_path, 'w') as f:
+        f.write("Sequence Name Mapping\n")
+        f.write("="*70 + "\n\n")
+        f.write("MVSEC Sequences:\n")
+        for info in mvsec_seqs:
+            f.write(f"  {info['seq_prefix']:12s} <- {info['sequence']}\n")
+        f.write("\nTUM-VIE Sequences:\n")
+        for info in tum_seqs:
+            f.write(f"  {info['seq_prefix']:12s} <- {info['sequence']}\n")
+    print(f"💾 Sequence mapping saved to: {mapping_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert left_events.h5 from all sequences to NPY format")
+    parser = argparse.ArgumentParser(description="Convert left_events.h5 from all sequences to NPZ format")
     
     parser.add_argument(
         "--dataset",
         "-d",
         required=True,
         type=str,
-        help="Path to root directory containing sequence folders"
+        help="Path to root directory containing sequence folders (e.g., /workspace/train-split)"
     )
     
     parser.add_argument(
@@ -212,7 +275,7 @@ if __name__ == "__main__":
         "-o",
         required=True,
         type=str,
-        help="Output directory for NPY files"
+        help="Output directory for NPZ files"
     )
     
     parser.add_argument(
@@ -220,7 +283,7 @@ if __name__ == "__main__":
         "-w",
         type=int,
         default=None,
-        help="Number of parallel workers (default: CPU count - 2)"
+        help="Number of parallel workers (default: CPU count - 2, suggested: 6 for your 8-core setup)"
     )
     
     parser.add_argument(
@@ -236,13 +299,9 @@ if __name__ == "__main__":
         "-c",
         type=int,
         default=10,
-        help="Number of samples per task (default: 10, try 20-50)"
+        help="Number of samples per task (default: 10, try 20-50 for faster processing)"
     )
     
     args = parser.parse_args()
-    
-    print("\n" + "="*60)
-    print("Left Events HDF5 → NPY Converter")
-    print("="*60)
     
     convert_parallel(args.dataset, args.output, args.workers, args.max_samples, args.chunksize)
