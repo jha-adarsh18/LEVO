@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
+from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 import os
 from tqdm import tqdm
@@ -19,7 +20,7 @@ class SequenceAwareSampler(Sampler):
     - Provides positives (1-5s apart) and negatives (>30s or different sequence)
     """
     
-    def __init__(self, dataset, batch_size=64, samples_per_sequence=8):
+    def __init__(self, dataset, batch_size=128, samples_per_sequence=8):
         self.dataset = dataset
         self.batch_size = batch_size
         self.samples_per_sequence = samples_per_sequence
@@ -76,7 +77,7 @@ class SequenceAwareSampler(Sampler):
 
 class InfoNCELoss(nn.Module):
     """
-    InfoNCE loss for contrastive learning:
+    Vectorized InfoNCE loss for contrastive learning:
     - Identifies positives (same sequence, close in time)
     - Uses all other samples in batch as negatives
     - Temperature-scaled softmax
@@ -103,103 +104,82 @@ class InfoNCELoss(nn.Module):
         # Compute similarity matrix [B, B]
         sim_matrix = torch.mm(descriptors, descriptors.t()) / self.temperature
         
-        # Create positive mask [B, B]
-        positive_mask = torch.zeros(B, B, dtype=torch.bool, device=device)
+        # Vectorized positive mask creation
+        sequences = torch.tensor([hash(m['sequence']) for m in metadata], device=device)
+        times = torch.tensor([m['time_mid'] for m in metadata], device=device)
         
-        for i in range(B):
-            for j in range(B):
-                if i == j:
-                    continue
-                
-                # Same sequence and close in time
-                same_seq = metadata[i]['sequence'] == metadata[j]['sequence']
-                time_diff = abs(metadata[i]['time_mid'] - metadata[j]['time_mid'])
-                close_time = time_diff < self.positive_time_threshold
-                
-                if same_seq and close_time:
-                    positive_mask[i, j] = True
+        # Same sequence mask [B, B]
+        same_seq_mask = sequences.unsqueeze(0) == sequences.unsqueeze(1)
         
-        # Create negative mask (all except self and positives)
+        # Time difference mask [B, B]
+        time_diff = torch.abs(times.unsqueeze(0) - times.unsqueeze(1))
+        close_time_mask = time_diff < self.positive_time_threshold
+        
+        # Positive mask: same sequence AND close time AND not self
+        positive_mask = same_seq_mask & close_time_mask
+        positive_mask.fill_diagonal_(False)
+        
+        # Negative mask: everything except self and positives
         negative_mask = ~positive_mask
-        negative_mask.fill_diagonal_(False)  # Exclude self
+        negative_mask.fill_diagonal_(False)
         
-        # Compute loss
-        losses = []
-        num_positives_per_sample = []
+        # Count positives per sample
+        num_positives = positive_mask.sum(dim=1)  # [B]
         
-        for i in range(B):
-            pos_indices = positive_mask[i]
-            neg_indices = negative_mask[i]
-            
-            num_pos = pos_indices.sum().item()
-            num_neg = neg_indices.sum().item()
-            
-            if num_pos == 0:
-                # No positives for this sample, skip
-                continue
-            
-            num_positives_per_sample.append(num_pos)
-            
-            # Positive similarities
-            pos_sim = sim_matrix[i, pos_indices]  # [num_pos]
-            
-            # Negative similarities
-            neg_sim = sim_matrix[i, neg_indices]  # [num_neg]
-            
-            # InfoNCE loss for each positive
-            for p in range(num_pos):
-                # Numerator: exp(sim with this positive)
-                numerator = torch.exp(pos_sim[p])
-                
-                # Denominator: sum of exp(sim with all negatives) + exp(sim with all positives)
-                denominator = torch.exp(pos_sim).sum() + torch.exp(neg_sim).sum()
-                
-                # Loss: -log(numerator / denominator)
-                loss = -torch.log(numerator / denominator)
-                losses.append(loss)
+        # Only process samples that have positives
+        valid_samples = num_positives > 0
         
-        if len(losses) == 0:
-            # No valid pairs in batch
+        if not valid_samples.any():
             return torch.tensor(0.0, device=device), {
                 'accuracy': 0.0,
                 'num_positives': 0,
                 'mean_pos_per_sample': 0.0
             }
         
-        total_loss = torch.stack(losses).mean()
+        # Vectorized loss computation
+        # For each sample, compute: -log(sum(exp(pos_sim)) / (sum(exp(pos_sim)) + sum(exp(neg_sim))))
         
-        # Compute accuracy (is positive similarity > all negative similarities?)
+        # Mask out invalid entries with large negative values
+        pos_sim = sim_matrix.clone()
+        pos_sim[~positive_mask] = -1e9
+        
+        neg_sim = sim_matrix.clone()
+        neg_sim[~negative_mask] = -1e9
+        
+        # Compute log-sum-exp for numerical stability
+        pos_exp_sum = torch.logsumexp(pos_sim, dim=1)  # [B]
+        neg_exp_sum = torch.logsumexp(neg_sim, dim=1)  # [B]
+        all_exp_sum = torch.logsumexp(torch.stack([pos_exp_sum, neg_exp_sum], dim=1), dim=1)  # [B]
+        
+        # Loss per sample
+        loss_per_sample = -(pos_exp_sum - all_exp_sum)  # [B]
+        
+        # Average over valid samples only
+        total_loss = loss_per_sample[valid_samples].mean()
+        
+        # Compute accuracy (is max positive similarity > max negative similarity?)
         with torch.no_grad():
-            correct = 0
-            total = 0
-            for i in range(B):
-                pos_indices = positive_mask[i]
-                neg_indices = negative_mask[i]
-                
-                if pos_indices.sum() == 0:
-                    continue
-                
-                pos_sim = sim_matrix[i, pos_indices]
-                neg_sim = sim_matrix[i, neg_indices]
-                
-                if neg_sim.numel() > 0:
-                    # Check if max positive > max negative
-                    if pos_sim.max() > neg_sim.max():
-                        correct += 1
-                    total += 1
+            max_pos_sim = sim_matrix.clone()
+            max_pos_sim[~positive_mask] = -float('inf')
+            max_pos_sim = max_pos_sim.max(dim=1).values  # [B]
             
-            accuracy = correct / total if total > 0 else 0.0
+            max_neg_sim = sim_matrix.clone()
+            max_neg_sim[~negative_mask] = -float('inf')
+            max_neg_sim = max_neg_sim.max(dim=1).values  # [B]
+            
+            correct = (max_pos_sim > max_neg_sim) & valid_samples
+            accuracy = correct.sum().item() / valid_samples.sum().item()
         
         metrics = {
             'accuracy': accuracy,
-            'num_positives': sum(num_positives_per_sample),
-            'mean_pos_per_sample': np.mean(num_positives_per_sample) if num_positives_per_sample else 0.0
+            'num_positives': num_positives.sum().item(),
+            'mean_pos_per_sample': num_positives[valid_samples].float().mean().item()
         }
         
         return total_loss, metrics
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
+def train_epoch(model, dataloader, optimizer, criterion, device, epoch, scaler):
     model.train()
     
     total_loss = 0.0
@@ -217,16 +197,16 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
         masks = torch.stack([d['mask'] for d in batch_data]).to(device)
         metadata = [{'sequence': d['sequence'], 'time_mid': d['time_mid']} for d in batch_data]
         
-        # Forward pass
-        descriptors = model(events, masks)
-        
-        # Compute loss
-        loss, metrics = criterion(descriptors, metadata)
+        # Forward pass with mixed precision
+        with autocast():
+            descriptors = model(events, masks)
+            loss, metrics = criterion(descriptors, metadata)
         
         if loss.item() > 0:  # Only backprop if valid loss
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             total_loss += loss.item()
             total_accuracy += metrics['accuracy']
@@ -263,7 +243,9 @@ def validate(model, dataloader, device):
             events = torch.stack([d['events'] for d in batch_data]).to(device)
             masks = torch.stack([d['mask'] for d in batch_data]).to(device)
             
-            descriptors = model(events, masks)
+            with autocast():
+                descriptors = model(events, masks)
+            
             all_descriptors.append(descriptors.cpu())
             
             for d in batch_data:
@@ -323,7 +305,7 @@ def validate(model, dataloader, device):
 def main():
     # Configuration
     dataset_root = r"/workspace/PEVSLAM/npy_cache"
-    batch_size = 64
+    batch_size = 128  # Increased from 64
     num_epochs = 50
     learning_rate = 1e-3
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -332,7 +314,7 @@ def main():
     
     # Load dataset
     print("Loading dataset...")
-    dataset = event_extractor(dataset_root, N=1024)
+    dataset = event_extractor(dataset_root, N=1024, num_workers=4)  # Reduced from 16
     
     # Split into train/val sequences
     sequences = list(dataset.sequence_map.keys())
@@ -363,7 +345,7 @@ def main():
     train_loader = DataLoader(
         dataset,
         batch_sampler=train_sampler,
-        num_workers=4,
+        num_workers=8,  # Increased from 4
         pin_memory=True
     )
     
@@ -376,7 +358,7 @@ def main():
     val_loader = DataLoader(
         dataset,
         batch_sampler=val_sampler,
-        num_workers=4,
+        num_workers=8,  # Increased from 4
         pin_memory=True
     )
     
@@ -398,6 +380,9 @@ def main():
     # Loss function
     criterion = InfoNCELoss(temperature=0.07, positive_time_threshold=5.0)
     
+    # Mixed precision scaler
+    scaler = GradScaler()
+    
     # Training loop
     best_recall = 0.0
     
@@ -408,13 +393,13 @@ def main():
         
         # Train
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device, epoch
+            model, train_loader, optimizer, criterion, device, epoch, scaler
         )
         
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.3f}")
         
-        # Validate every 5 epochs
-        if epoch % 5 == 0:
+        # Validate every 10 epochs (reduced from 5)
+        if epoch % 10 == 0:
             print("\nValidating...")
             recall_1, recall_5, recall_10 = validate(model, val_loader, device)
             
