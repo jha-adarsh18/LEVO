@@ -1,78 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Sampler
-from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 import numpy as np
 import os
 from tqdm import tqdm
 import random
+import argparse
 
 from utils.loadevents import event_extractor
-from model import PEVSLAM
-
-
-class SequenceAwareSampler(Sampler):
-    """
-    Smart sampler that creates batches with proper positives/negatives:
-    - Samples full sequences (5-8 packets each)
-    - Ensures temporal structure is preserved
-    - Provides positives (1-5s apart) and negatives (>30s or different sequence)
-    """
-    
-    def __init__(self, dataset, batch_size=128, samples_per_sequence=8):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.samples_per_sequence = samples_per_sequence
-        
-        # Group indices by sequence
-        self.sequence_groups = {}
-        for idx, sample_info in enumerate(dataset.flat_samples):
-            seq = sample_info['sequence']
-            if seq not in self.sequence_groups:
-                self.sequence_groups[seq] = []
-            self.sequence_groups[seq].append(idx)
-        
-        self.sequences = list(self.sequence_groups.keys())
-        print(f"Sampler: {len(self.sequences)} sequences, batch_size={batch_size}")
-    
-    def __iter__(self):
-        # Shuffle sequences
-        random.shuffle(self.sequences)
-        
-        batches = []
-        current_batch = []
-        
-        for seq in self.sequences:
-            indices = self.sequence_groups[seq]
-            
-            # Sample up to samples_per_sequence packets from this sequence
-            if len(indices) > self.samples_per_sequence:
-                sampled = random.sample(indices, self.samples_per_sequence)
-            else:
-                sampled = indices
-            
-            current_batch.extend(sampled)
-            
-            # When batch is full, yield it
-            while len(current_batch) >= self.batch_size:
-                batches.append(current_batch[:self.batch_size])
-                current_batch = current_batch[self.batch_size:]
-        
-        # Add remaining samples
-        if len(current_batch) > 0:
-            batches.append(current_batch)
-        
-        # Shuffle batches
-        random.shuffle(batches)
-        
-        for batch in batches:
-            yield batch
-    
-    def __len__(self):
-        total_samples = sum(min(len(indices), self.samples_per_sequence) 
-                          for indices in self.sequence_groups.values())
-        return (total_samples + self.batch_size - 1) // self.batch_size
+from scripts.pevslam_net import PEVSLAM
 
 
 class InfoNCELoss(nn.Module):
@@ -136,26 +74,38 @@ class InfoNCELoss(nn.Module):
                 'mean_pos_per_sample': 0.0
             }
         
-        # Vectorized loss computation
-        # For each sample, compute: -log(sum(exp(pos_sim)) / (sum(exp(pos_sim)) + sum(exp(neg_sim))))
+        # Compute loss per sample using stable logsumexp
+        loss_per_sample = []
         
-        # Mask out invalid entries with large negative values
-        pos_sim = sim_matrix.clone()
-        pos_sim[~positive_mask] = -1e9
+        for i in range(B):
+            if not valid_samples[i]:
+                continue
+            
+            # Get positive and negative similarities for this sample
+            pos_sims = sim_matrix[i][positive_mask[i]]  # Only positive similarities
+            neg_sims = sim_matrix[i][negative_mask[i]]  # Only negative similarities
+            
+            if len(pos_sims) == 0 or len(neg_sims) == 0:
+                continue
+            
+            # Compute: log(sum(exp(pos))) - log(sum(exp(pos)) + sum(exp(neg)))
+            pos_term = torch.logsumexp(pos_sims, dim=0)
+            
+            # Combine pos and neg for denominator
+            all_sims = torch.cat([pos_sims, neg_sims], dim=0)
+            all_term = torch.logsumexp(all_sims, dim=0)
+            
+            sample_loss = -(pos_term - all_term)
+            loss_per_sample.append(sample_loss)
         
-        neg_sim = sim_matrix.clone()
-        neg_sim[~negative_mask] = -1e9
+        if len(loss_per_sample) == 0:
+            return torch.tensor(0.0, device=device), {
+                'accuracy': 0.0,
+                'num_positives': 0,
+                'mean_pos_per_sample': 0.0
+            }
         
-        # Compute log-sum-exp for numerical stability
-        pos_exp_sum = torch.logsumexp(pos_sim, dim=1)  # [B]
-        neg_exp_sum = torch.logsumexp(neg_sim, dim=1)  # [B]
-        all_exp_sum = torch.logsumexp(torch.stack([pos_exp_sum, neg_exp_sum], dim=1), dim=1)  # [B]
-        
-        # Loss per sample
-        loss_per_sample = -(pos_exp_sum - all_exp_sum)  # [B]
-        
-        # Average over valid samples only
-        total_loss = loss_per_sample[valid_samples].mean()
+        total_loss = torch.stack(loss_per_sample).mean()
         
         # Compute accuracy (is max positive similarity > max negative similarity?)
         with torch.no_grad():
@@ -179,6 +129,11 @@ class InfoNCELoss(nn.Module):
         return total_loss, metrics
 
 
+def collate_fn(batch):
+    """Custom collate function to handle batch data"""
+    return batch
+
+
 def train_epoch(model, dataloader, optimizer, criterion, device, epoch, scaler):
     model.train()
     
@@ -189,35 +144,34 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch, scaler):
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
-    for batch_indices in pbar:
-        # Get batch data
-        batch_data = [dataloader.dataset[idx] for idx in batch_indices]
-        
+    for batch_data in pbar:
         events = torch.stack([d['events'] for d in batch_data]).to(device)
         masks = torch.stack([d['mask'] for d in batch_data]).to(device)
         metadata = [{'sequence': d['sequence'], 'time_mid': d['time_mid']} for d in batch_data]
         
         # Forward pass with mixed precision
-        with autocast():
+        with autocast(device_type='cuda'):
             descriptors = model(events, masks)
             loss, metrics = criterion(descriptors, metadata)
         
-        if loss.item() > 0:  # Only backprop if valid loss
+        # Always track metrics
+        total_loss += loss.item()
+        total_accuracy += metrics['accuracy']
+        total_positives += metrics['num_positives']
+        num_batches += 1
+        
+        # Backprop only on non-zero loss
+        if loss.item() > 0:
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            
-            total_loss += loss.item()
-            total_accuracy += metrics['accuracy']
-            total_positives += metrics['num_positives']
-            num_batches += 1
-            
-            pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'acc': f"{metrics['accuracy']:.3f}",
-                'pos': int(metrics['mean_pos_per_sample'])
-            })
+        
+        pbar.set_postfix({
+            'loss': f"{loss.item():.4f}",
+            'acc': f"{metrics['accuracy']:.3f}",
+            'pos': int(metrics['mean_pos_per_sample'])
+        })
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     avg_accuracy = total_accuracy / num_batches if num_batches > 0 else 0.0
@@ -237,13 +191,11 @@ def validate(model, dataloader, device):
     all_metadata = []
     
     with torch.no_grad():
-        for batch_indices in tqdm(dataloader, desc="Validation"):
-            batch_data = [dataloader.dataset[idx] for idx in batch_indices]
-            
+        for batch_data in tqdm(dataloader, desc="Validation"):
             events = torch.stack([d['events'] for d in batch_data]).to(device)
             masks = torch.stack([d['mask'] for d in batch_data]).to(device)
             
-            with autocast():
+            with autocast(device_type='cuda'):
                 descriptors = model(events, masks)
             
             all_descriptors.append(descriptors.cpu())
@@ -303,28 +255,77 @@ def validate(model, dataloader, device):
 
 
 def main():
+    # Argument parser
+    parser = argparse.ArgumentParser(description='Train PEVSLAM place recognition model')
+    parser.add_argument('--dataset_root', type=str, default='/workspace/npy_cache',
+                        help='Path to NPZ dataset')
+    parser.add_argument('--batch_size', type=int, default=128,
+                        help='Batch size for training')
+    parser.add_argument('--num_epochs', type=int, default=50,
+                        help='Number of training epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-3,
+                        help='Learning rate')
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Number of dataloader workers')
+    parser.add_argument('--debug', action='store_true',
+                        help='Debug mode: load only 0.1%% of data for quick testing')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                        help='Directory to save checkpoints')
+    
+    args = parser.parse_args()
+    
     # Configuration
-    dataset_root = r"/workspace/PEVSLAM/npy_cache"
-    batch_size = 128  # Increased from 64
-    num_epochs = 50
-    learning_rate = 1e-3
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
     
     print(f"Using device: {device}")
+    if args.debug:
+        print("⚠️  DEBUG MODE: Loading only 0.1% of data for testing")
     
-    # Load dataset
+    # Load dataset with debug flag
     print("Loading dataset...")
-    dataset = event_extractor(dataset_root, N=1024, num_workers=4)  # Reduced from 16
+    dataset = event_extractor(args.dataset_root, N=1024, num_workers=4, debug=args.debug)
+    
+    print(f"Dataset loaded: {len(dataset.flat_samples)} samples")
     
     # Split into train/val sequences
     sequences = list(dataset.sequence_map.keys())
     random.shuffle(sequences)
     
-    val_sequences = sequences[:2]  # 2 sequences for validation
-    train_sequences = sequences[2:]  # Rest for training
+    # In debug mode, use fewer sequences for validation
+    if args.debug:
+        val_sequences = sequences[:1] if len(sequences) > 1 else sequences[:1]
+        train_sequences = sequences[1:] if len(sequences) > 1 else []
+    else:
+        # Use 10% of sequences for validation (at least 2)
+        num_val = max(2, len(sequences) // 10)
+        val_sequences = sequences[:num_val]
+        train_sequences = sequences[num_val:]
     
-    print(f"Training sequences: {train_sequences}")
-    print(f"Validation sequences: {val_sequences}")
+    print(f"\nTraining sequences: {len(train_sequences)}")
+    print(f"Validation sequences: {len(val_sequences)}")
+    
+    # Create subset datasets for train/val
+    class SubsetDataset:
+        """Wrapper to create a subset view of the dataset"""
+        def __init__(self, dataset, indices):
+            self.dataset = dataset
+            self.indices = indices
+            self.flat_samples = [dataset.flat_samples[i] for i in indices]
+            # Create new sequence_map for this subset
+            self.sequence_map = {}
+            for i in indices:
+                sample = dataset.flat_samples[i]
+                seq = sample['sequence']
+                if seq not in self.sequence_map:
+                    self.sequence_map[seq] = []
+                self.sequence_map[seq].append(sample)
+        
+        def __len__(self):
+            return len(self.indices)
+        
+        def __getitem__(self, idx):
+            return self.dataset[self.indices[idx]]
     
     # Create train/val splits
     train_indices = [i for i, s in enumerate(dataset.flat_samples) 
@@ -332,63 +333,59 @@ def main():
     val_indices = [i for i, s in enumerate(dataset.flat_samples) 
                   if s['sequence'] in val_sequences]
     
-    print(f"Training samples: {len(train_indices)}")
-    print(f"Validation samples: {len(val_indices)}")
+    train_dataset = SubsetDataset(dataset, train_indices)
+    val_dataset = SubsetDataset(dataset, val_indices)
     
-    # Create samplers and dataloaders
-    train_sampler = SequenceAwareSampler(
-        dataset, 
-        batch_size=batch_size,
-        samples_per_sequence=8
-    )
+    print(f"Training samples: {len(train_dataset):,}")
+    print(f"Validation samples: {len(val_dataset):,}")
     
+    # Create dataloaders with sequential order (keep time close)
     train_loader = DataLoader(
-        dataset,
-        batch_sampler=train_sampler,
-        num_workers=8,  # Increased from 4
-        pin_memory=True
-    )
-    
-    val_sampler = SequenceAwareSampler(
-        dataset,
-        batch_size=batch_size,
-        samples_per_sequence=100  # Use all samples for validation
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,  # Sequential - keeps temporally close samples together
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=True  # Drop incomplete batches for consistent batch size
     )
     
     val_loader = DataLoader(
-        dataset,
-        batch_sampler=val_sampler,
-        num_workers=8,  # Increased from 4
-        pin_memory=True
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn
     )
+    
+    print(f"\nBatches per epoch: {len(train_loader):,}")
+    print(f"Validation batches: {len(val_loader):,}\n")
     
     # Create model
     model = PEVSLAM(
         base_channel=4,
-        descriptor_dim=256,
-        num_heads=8,
-        num_layers=4,
-        dropout=0.1
+        descriptor_dim=256
     ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     
     # Loss function
     criterion = InfoNCELoss(temperature=0.07, positive_time_threshold=5.0)
     
     # Mixed precision scaler
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     
     # Training loop
     best_recall = 0.0
     
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(1, args.num_epochs + 1):
         print(f"\n{'='*60}")
-        print(f"Epoch {epoch}/{num_epochs}")
+        print(f"Epoch {epoch}/{args.num_epochs}")
         print(f"{'='*60}")
         
         # Train
@@ -396,10 +393,11 @@ def main():
             model, train_loader, optimizer, criterion, device, epoch, scaler
         )
         
-        print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.3f}")
+        print(f"\nTrain Loss: {train_loss:.4f}, Train Acc: {train_acc:.3f}")
         
-        # Validate every 10 epochs (reduced from 5)
-        if epoch % 10 == 0:
+        # Validate every 5 epochs (or every epoch in debug mode)
+        validate_freq = 1 if args.debug else 5
+        if epoch % validate_freq == 0:
             print("\nValidating...")
             recall_1, recall_5, recall_10 = validate(model, val_loader, device)
             
@@ -410,19 +408,37 @@ def main():
             # Save best model
             if recall_10 > best_recall:
                 best_recall = recall_10
+                checkpoint_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'recall_10': recall_10,
-                }, 'best_model.pth')
-                print(f"Saved best model (Recall@10: {recall_10:.3f})")
+                    'recall_5': recall_5,
+                    'recall_1': recall_1,
+                }, checkpoint_path)
+                print(f"💾 Saved best model (Recall@10: {recall_10:.3f})")
         
-        # Step scheduler
+        # Save checkpoint every 10 epochs
+        if epoch % 10 == 0:
+            checkpoint_path = os.path.join(args.checkpoint_dir, f'checkpoint_epoch_{epoch}.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, checkpoint_path)
+            print(f"💾 Saved checkpoint: epoch {epoch}")
+        
+        # Step scheduler after epoch
         scheduler.step()
         print(f"Learning rate: {scheduler.get_last_lr()[0]:.6f}")
+        
+        # In debug mode, exit after 2 epochs
+        if args.debug and epoch >= 2:
+            print("\n✅ Debug mode: Training test completed successfully!")
+            break
     
-    print("\nTraining completed!")
+    print("\n🎉 Training completed!")
     print(f"Best Recall@10: {best_recall:.3f}")
 
 
