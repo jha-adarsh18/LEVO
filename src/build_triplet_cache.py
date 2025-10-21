@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build triplet cache for metric learning from pose data.
+Build triplet cache for metric learning from pose data (GPU-accelerated).
 
 Input:
   - poses.h5 (from pose converter script)
@@ -20,21 +20,67 @@ import argparse
 import h5py
 import numpy as np
 from pathlib import Path
-from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 import json
+import torch
 
 
-def rotation_angle_between_quaternions(q1, q2):
+def quat_to_rotation_matrix_batch(quats):
     """
-    Calculate rotation angle in degrees between two quaternions.
-    q1, q2: quaternions in (x, y, z, w) format
+    Convert batch of quaternions to rotation matrices on GPU.
+    quats: [N, 4] tensor (x, y, z, w)
+    Returns: [N, 3, 3] rotation matrices
     """
-    r1 = Rotation.from_quat(q1)
-    r2 = Rotation.from_quat(q2)
-    relative_rotation = r1.inv() * r2
-    angle = relative_rotation.magnitude() * 180 / np.pi
-    return angle
+    x, y, z, w = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
+    
+    # Normalize
+    norm = torch.sqrt(x*x + y*y + z*z + w*w)
+    x, y, z, w = x/norm, y/norm, z/norm, w/norm
+    
+    # Build rotation matrices
+    R = torch.zeros(len(quats), 3, 3, device=quats.device, dtype=quats.dtype)
+    
+    R[:, 0, 0] = 1 - 2*(y*y + z*z)
+    R[:, 0, 1] = 2*(x*y - w*z)
+    R[:, 0, 2] = 2*(x*z + w*y)
+    
+    R[:, 1, 0] = 2*(x*y + w*z)
+    R[:, 1, 1] = 1 - 2*(x*x + z*z)
+    R[:, 1, 2] = 2*(y*z - w*x)
+    
+    R[:, 2, 0] = 2*(x*z - w*y)
+    R[:, 2, 1] = 2*(y*z + w*x)
+    R[:, 2, 2] = 1 - 2*(x*x + y*y)
+    
+    return R
+
+
+def rotation_angles_batch(q1, quats_batch):
+    """
+    Calculate rotation angles between one quaternion and a batch.
+    q1: [4] single quaternion (x, y, z, w)
+    quats_batch: [N, 4] batch of quaternions
+    Returns: [N] angles in degrees
+    """
+    device = quats_batch.device
+    
+    # Convert to rotation matrices
+    R1 = quat_to_rotation_matrix_batch(q1.unsqueeze(0))[0]  # [3, 3]
+    R2_batch = quat_to_rotation_matrix_batch(quats_batch)  # [N, 3, 3]
+    
+    # Relative rotation: R1^T @ R2
+    R_rel = torch.matmul(R1.T.unsqueeze(0), R2_batch)  # [N, 3, 3]
+    
+    # Angle from trace: theta = arccos((trace(R) - 1) / 2)
+    traces = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]  # [N]
+    
+    # Clamp for numerical stability
+    cos_angle = (traces - 1) / 2
+    cos_angle = torch.clamp(cos_angle, -1.0, 1.0)
+    
+    angles = torch.acos(cos_angle) * 180 / np.pi  # [N] in degrees
+    
+    return angles
 
 
 def load_poses(poses_h5_path):
@@ -59,68 +105,93 @@ def load_poses(poses_h5_path):
     return sequences, sequence_names
 
 
-def find_positives(anchor_pos, anchor_quat, anchor_time, anchor_seq_idx,
-                   target_positions, target_quaternions, target_times, target_seq_idx,
-                   pos_dist_thresh=0.5, min_angle=15, max_angle=60, min_time_gap=1.0):
+def find_positives_gpu(anchor_pos, anchor_quat, anchor_time, anchor_seq_idx,
+                       target_positions, target_quaternions, target_times, target_seq_idx,
+                       pos_dist_thresh=0.5, min_angle=15, max_angle=60, min_time_gap=1.0,
+                       device='cuda'):
     """
-    Find positive samples: same location, different viewpoint, time gap.
+    Find positive samples using GPU acceleration.
     
-    Returns: list of valid positive indices
+    Returns: numpy array of valid positive indices
     """
-    # Calculate distances
-    distances = np.linalg.norm(target_positions - anchor_pos, axis=1)
+    # Convert to tensors
+    anchor_pos_t = torch.from_numpy(anchor_pos).float().to(device)
+    anchor_quat_t = torch.from_numpy(anchor_quat).float().to(device)
+    target_pos_t = torch.from_numpy(target_positions).float().to(device)
+    target_quat_t = torch.from_numpy(target_quaternions).float().to(device)
     
-    # Calculate rotation angles
-    angles = np.array([
-        rotation_angle_between_quaternions(anchor_quat, q) 
-        for q in target_quaternions
-    ])
+    # Calculate distances (GPU)
+    distances = torch.norm(target_pos_t - anchor_pos_t, dim=1)
+    location_mask = distances <= pos_dist_thresh
+    
+    # Early exit if no candidates
+    candidate_indices = torch.where(location_mask)[0]
+    if len(candidate_indices) == 0:
+        return np.array([], dtype=np.int64)
+    
+    # Calculate rotation angles only for distance-valid candidates (GPU)
+    candidate_quats = target_quat_t[candidate_indices]
+    angles_candidates = rotation_angles_batch(anchor_quat_t, candidate_quats)
+    
+    # Build full angle array
+    angles = torch.zeros(len(target_quaternions), device=device)
+    angles[candidate_indices] = angles_candidates
     
     # Calculate time gaps
     time_gaps = np.abs(target_times - anchor_time)
+    time_gaps_t = torch.from_numpy(time_gaps).float().to(device)
     
-    # Apply constraints
-    location_mask = distances <= pos_dist_thresh
+    # Apply all constraints
     angle_mask = (angles >= min_angle) & (angles <= max_angle)
-    time_mask = time_gaps >= min_time_gap
+    time_mask = time_gaps_t >= min_time_gap
     
-    # If same sequence, enforce time gap; if different sequence, no time constraint needed
+    # If same sequence, enforce time gap; if different sequence, no time constraint
     if anchor_seq_idx == target_seq_idx:
         valid_mask = location_mask & angle_mask & time_mask
     else:
         valid_mask = location_mask & angle_mask
     
-    valid_indices = np.where(valid_mask)[0]
+    valid_indices = torch.where(valid_mask)[0].cpu().numpy()
     return valid_indices
 
 
-def find_hard_negatives(anchor_pos, anchor_quat, 
-                        target_positions, target_quaternions,
-                        neg_dist_thresh=3.0, similar_angle_thresh=10):
+def find_hard_negatives_gpu(anchor_pos, anchor_quat,
+                            target_positions, target_quaternions,
+                            neg_dist_thresh=3.0, similar_angle_thresh=10,
+                            device='cuda'):
     """
-    Find hard negative samples:
-    1. Far location (>3m)
-    2. Similar viewpoint but different location (visually similar but wrong place)
+    Find hard negative samples using GPU acceleration.
     
-    Returns: list of valid negative indices
+    Returns: numpy array of valid negative indices
     """
-    # Calculate distances
-    distances = np.linalg.norm(target_positions - anchor_pos, axis=1)
+    # Convert to tensors
+    anchor_pos_t = torch.from_numpy(anchor_pos).float().to(device)
+    anchor_quat_t = torch.from_numpy(anchor_quat).float().to(device)
+    target_pos_t = torch.from_numpy(target_positions).float().to(device)
+    target_quat_t = torch.from_numpy(target_quaternions).float().to(device)
     
-    # Calculate rotation angles
-    angles = np.array([
-        rotation_angle_between_quaternions(anchor_quat, q) 
-        for q in target_quaternions
-    ])
+    # Calculate distances (GPU)
+    distances = torch.norm(target_pos_t - anchor_pos_t, dim=1)
     
-    # Hard negatives: far away
+    # Far negatives (don't need angle check)
     far_mask = distances > neg_dist_thresh
     
-    # Hard negatives: similar angle but different location (0.5m to 3m away with similar view)
-    similar_view_diff_place = (distances > 0.5) & (distances <= neg_dist_thresh) & (angles < similar_angle_thresh)
+    # For "similar view different place", check middle distance range
+    middle_dist_mask = (distances > 0.5) & (distances <= neg_dist_thresh)
+    middle_dist_indices = torch.where(middle_dist_mask)[0]
+    
+    # Only compute angles for middle distance candidates
+    angles = torch.zeros(len(target_quaternions), device=device)
+    if len(middle_dist_indices) > 0:
+        middle_quats = target_quat_t[middle_dist_indices]
+        angles_middle = rotation_angles_batch(anchor_quat_t, middle_quats)
+        angles[middle_dist_indices] = angles_middle
+    
+    # Similar view but different place
+    similar_view_diff_place = middle_dist_mask & (angles < similar_angle_thresh)
     
     valid_mask = far_mask | similar_view_diff_place
-    valid_indices = np.where(valid_mask)[0]
+    valid_indices = torch.where(valid_mask)[0].cpu().numpy()
     
     return valid_indices
 
@@ -131,9 +202,10 @@ def build_triplets(sequences, sequence_names,
                    min_angle=15,
                    max_angle=60,
                    min_time_gap=1.0,
-                   neg_dist_thresh=3.0):
+                   neg_dist_thresh=3.0,
+                   device='cuda'):
     """
-    Build triplet indices for all sequences.
+    Build triplet indices for all sequences using GPU acceleration.
     
     Returns: 
         triplets: array of shape [N, 6] with (anchor_seq, anchor_idx, pos_seq, pos_idx, neg_seq, neg_idx)
@@ -147,7 +219,7 @@ def build_triplets(sequences, sequence_names,
         'per_sequence_stats': {}
     }
     
-    print("Building triplets...")
+    print(f"Building triplets on {device}...")
     
     for anchor_seq_name in tqdm(sequence_names, desc="Processing sequences"):
         anchor_data = sequences[anchor_seq_name]
@@ -158,11 +230,10 @@ def build_triplets(sequences, sequence_names,
             'triplets_generated': 0
         }
         
-        # Sample anchors (can use all or subsample)
         n_poses = len(anchor_data['timestamps'])
         anchor_indices = np.arange(n_poses)
         
-        for anchor_idx in anchor_indices:
+        for anchor_idx in tqdm(anchor_indices, desc=f"  {anchor_seq_name}", leave=False):
             anchor_pos = anchor_data['positions'][anchor_idx]
             anchor_quat = anchor_data['quaternions'][anchor_idx]
             anchor_time = anchor_data['timestamps'][anchor_idx]
@@ -176,13 +247,14 @@ def build_triplets(sequences, sequence_names,
                 target_data = sequences[target_seq_name]
                 target_seq_idx = target_data['seq_idx']
                 
-                pos_indices = find_positives(
+                pos_indices = find_positives_gpu(
                     anchor_pos, anchor_quat, anchor_time, anchor_seq_idx,
                     target_data['positions'],
                     target_data['quaternions'],
                     target_data['timestamps'],
                     target_seq_idx,
-                    pos_dist_thresh, min_angle, max_angle, min_time_gap
+                    pos_dist_thresh, min_angle, max_angle, min_time_gap,
+                    device
                 )
                 
                 for pos_idx in pos_indices:
@@ -200,11 +272,12 @@ def build_triplets(sequences, sequence_names,
                 target_data = sequences[target_seq_name]
                 target_seq_idx = target_data['seq_idx']
                 
-                neg_indices = find_hard_negatives(
+                neg_indices = find_hard_negatives_gpu(
                     anchor_pos, anchor_quat,
                     target_data['positions'],
                     target_data['quaternions'],
-                    neg_dist_thresh
+                    neg_dist_thresh,
+                    device=device
                 )
                 
                 for neg_idx in neg_indices:
@@ -270,7 +343,7 @@ def save_triplet_cache(output_path, triplets, metadata, sequence_names):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Build triplet cache for metric learning from pose data'
+        description='Build triplet cache for metric learning from pose data (GPU-accelerated)'
     )
     parser.add_argument('poses_h5', type=str, help='Path to poses.h5 file')
     parser.add_argument('--output', type=str, default='triplet_cache.h5', 
@@ -287,8 +360,20 @@ def main():
                         help='Minimum time gap for positives in seconds (default: 1.0)')
     parser.add_argument('--neg-dist', type=float, default=3.0,
                         help='Negative distance threshold in meters (default: 3.0)')
+    parser.add_argument('--device', type=str, default='cuda',
+                        choices=['cuda', 'cpu'],
+                        help='Device to use (default: cuda)')
     
     args = parser.parse_args()
+    
+    # Check CUDA availability
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        print("Warning: CUDA not available, falling back to CPU")
+        args.device = 'cpu'
+    
+    if args.device == 'cuda':
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     
     poses_path = Path(args.poses_h5)
     if not poses_path.exists():
@@ -308,7 +393,8 @@ def main():
         min_angle=args.min_angle,
         max_angle=args.max_angle,
         min_time_gap=args.min_time_gap,
-        neg_dist_thresh=args.neg_dist
+        neg_dist_thresh=args.neg_dist,
+        device=args.device
     )
     
     # Save cache
