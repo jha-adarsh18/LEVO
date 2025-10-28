@@ -1,0 +1,44 @@
+# config.yaml
+intrinsics:
+  indoor_flying:
+    fx: 226.38018519795807
+    fy: 226.15002947047415
+    cx: 173.6470807871759
+    cy: 133.73271487507847
+    resolution: [346, 260]
+  
+  outdoor_night:
+    fx: 225.7028124771077
+    fy: 225.3928747331328
+    cx: 167.3925764568589
+    cy: 126.81201949043754
+    resolution: [346, 260]
+  
+  outdoor_day:
+    fx: 223.9940010790056
+    fy: 223.61783486959376
+    cx: 170.7684322973841
+    cy: 128.18711828338436
+    resolution: [346, 260]
+  
+  group_D:
+    fx: 1049.5830934616608
+    fy: 1049.4229746040553
+    cx: 634.7184038833433
+    cy: 263.46974530961836
+    resolution: [1280, 720]
+    sequences:
+      - loop-floor0
+      - loop-floor1
+      - loop-floor2
+      - loop-floor3
+      - mocap-desk
+      - mocap-desk2
+      - skate-easy
+  
+  default:
+    fx: 1051.3170714099033
+    fy: 1051.7952009807022
+    cx: 636.1348547903337
+    cy: 265.7059221322115
+    resolution: [1280, 720]
