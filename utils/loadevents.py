@@ -1,272 +1,221 @@
 import numpy as np
 import os
-from bisect import bisect_left
-import h5py
-import hdf5plugin
+from glob import glob
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from multiprocessing import Pool
+import pickle
 
 class EventExtractionDataset(Dataset):
-    def __init__(self, dataset_root, width = None, height = None, t = 5000, N = 1024):
-        self.width = width
-        self.height = height
-        self.t = t
+    def __init__(self, dataset_root, N=1024, num_workers=16, debug=False):
+        self.dataset_root = dataset_root
         self.N = N
-        self.sequences = []
+        self.num_workers = num_workers
+        self.debug = debug
         self.flat_samples = []
-        self.discover_sequences(dataset_root)
-        self.cache_metadata()
-        self.generate_flat_samples()
-    
-    def discover_sequences(self, dataset_root):
-        for sequence in os.listdir(dataset_root):
-            sequence_path = os.path.join(dataset_root, sequence)
-            if not os.path.isdir(sequence_path):
-                continue
-            
-            left_path = None
-            right_path = None
-            pose_path = None
-            
-            for item in os.listdir(sequence_path):
-                if "left" in item.lower():
-                    left_path = os.path.join(sequence_path, item)
-                elif "right" in item.lower():
-                    right_path = os.path.join(sequence_path, item)
-                else:
-                    pose_path = os.path.join(sequence_path, item)
-            
-            if left_path and right_path and pose_path:
-                self.sequences.append({
-                    'sequence': sequence,
-                    'path': sequence_path,
-                    'left_events_path': left_path,  
-                    'right_events_path': right_path,
-                    'pose_path': pose_path
-                })
-    
-    def cache_metadata(self):
-        for seq_info in self.sequences:
-            if "indoor" in seq_info['sequence'].lower() or "outdoor" in seq_info['sequence'].lower():
-                seq_info['height'] = 260
-                seq_info['width'] = 346
-                seq_info['use_ms_idx'] = False
-            else:
-                seq_info['height'] = 720
-                seq_info['width'] = 1280
-                seq_info['use_ms_idx'] = True
-            
-            with h5py.File(seq_info['left_events_path'], "r") as e_left, \
-             h5py.File(seq_info['right_events_path'], "r") as e_right:
-                seq_info['time_start'] = min(float(e_left["events/t"][0]), float(e_right["events/t"][0]))
-                seq_info['time_end'] = max(float(e_left["events/t"][-1]), float(e_right["events/t"][-1]))
-
-            poses = np.loadtxt(seq_info['pose_path'])
-            seq_info['poses'] = poses
-
-    def generate_flat_samples(self):
-        """Generate lightweight time window indices instead of loading all data"""
-        print("Generating flat samples...")
-        for seq_idx, seq_info in tqdm(enumerate(self.sequences), total=len(self.sequences), desc="Processing sequences"):
-            t_start = seq_info['time_start']
-            t_end = seq_info['time_end']
-            current_time = t_start
+        self.sequence_map = {}
         
-            while current_time < t_end:
-                window_end = min(current_time + self.t, t_end)
+        self.discover_and_load_metadata()
+    
+    def discover_and_load_metadata(self):
+        """Load all metadata with caching support"""
+        
+        # Create cache filename based on dataset root and debug mode
+        cache_key = f"debug_{self.debug}" if self.debug else "full"
+        cache_file = os.path.join(self.dataset_root, f'metadata_cache_{cache_key}.pkl')
+        
+        # Try loading from cache
+        if os.path.exists(cache_file):
+            print(f"📦 Loading metadata from cache: {cache_file}")
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached_data = pickle.load(f)
+                    self.flat_samples = cached_data['flat_samples']
+                    self.sequence_map = cached_data['sequence_map']
+                print(f"✅ Loaded {len(self.flat_samples)} samples from {len(self.sequence_map)} sequences (cached)")
                 
-                # Store only lightweight metadata, not actual events
-                self.flat_samples.append({
-                    'seq_idx': seq_idx,
-                    't_start': current_time,
-                    't_end': window_end
-                })
+                # Print sequence stats
+                print("\nSequence statistics:")
+                for seq_name, samples in self.sequence_map.items():
+                    duration = (samples[-1]['time_end'] - samples[0]['time_start']) / 1e6  # seconds
+                    print(f"  {seq_name}: {len(samples)} packets, {duration:.1f}s duration")
+                return
+            except Exception as e:
+                print(f"⚠️  Cache load failed: {e}")
+                print("Rebuilding metadata from scratch...")
         
-                current_time += self.t
-
-        print(f"Generated {len(self.flat_samples)} time windows")
-
+        # Cache miss - load from NPZ files
+        print(f"Discovering NPZ files in {self.dataset_root}...")
+        npz_files = sorted(glob(os.path.join(self.dataset_root, '*.npz')))
+        
+        if not npz_files:
+            raise ValueError(f"No NPZ files found in {self.dataset_root}")
+        
+        # DEBUG MODE: Load only 0.1% of files
+        if self.debug:
+            original_count = len(npz_files)
+            sample_count = max(100, int(original_count * 0.001))  # At least 100 files
+            npz_files = npz_files[:sample_count]
+            print(f"⚠️  DEBUG MODE: Loading only {len(npz_files)}/{original_count} files ({len(npz_files)/original_count*100:.2f}%)")
+        else:
+            print(f"Found {len(npz_files)} NPZ files")
+        
+        print(f"Loading metadata with {self.num_workers} workers...")
+        
+        # Parallel metadata loading
+        with Pool(self.num_workers) as pool:
+            all_metadata = list(tqdm(
+                pool.imap(self._load_single_metadata, npz_files, chunksize=1000),
+                total=len(npz_files),
+                desc="Loading metadata"
+            ))
+        
+        # Group by sequence
+        sequence_map = {}
+        for meta in all_metadata:
+            seq = meta['sequence']
+            if seq not in sequence_map:
+                sequence_map[seq] = []
+            sequence_map[seq].append(meta)
+        
+        # Sort by time within each sequence
+        for seq_name in sequence_map:
+            sequence_map[seq_name].sort(key=lambda x: x['time_start'])
+        
+        # Flatten with sequence position info
+        for seq_name, samples in sequence_map.items():
+            for pos, sample in enumerate(samples):
+                sample['position_in_sequence'] = pos
+                sample['sequence_length'] = len(samples)
+                self.flat_samples.append(sample)
+        
+        self.sequence_map = sequence_map
+        
+        print(f"\nLoaded {len(self.flat_samples)} samples from {len(sequence_map)} sequences")
+        print("\nSequence statistics:")
+        for seq_name, samples in self.sequence_map.items():
+            duration = (samples[-1]['time_end'] - samples[0]['time_start']) / 1e6  # seconds
+            print(f"  {seq_name}: {len(samples)} packets, {duration:.1f}s duration")
+        
+        # Save to cache
+        print(f"\n💾 Saving metadata to cache: {cache_file}")
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump({
+                    'flat_samples': self.flat_samples,
+                    'sequence_map': self.sequence_map
+                }, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print("✅ Cache saved successfully")
+        except Exception as e:
+            print(f"⚠️  Failed to save cache: {e}")
+    
+    @staticmethod
+    def _load_single_metadata(npz_path):
+        """Static method for parallel loading"""
+        data = np.load(npz_path)
+        return {
+            'filepath': npz_path,
+            'filename': os.path.basename(npz_path),
+            'sequence': str(data['sequence']),
+            'time_start': float(data['time_window'][0]),
+            'time_end': float(data['time_window'][1]),
+            'time_mid': float(data['time_mid'])
+        }
+    
     def __len__(self):
         return len(self.flat_samples)
     
-    def get_events(self, file_path, t_start, t_end, use_ms_idx=True):
-        with h5py.File(file_path, "r") as f:
-            return self.get_events_from_file(f, t_start, t_end, use_ms_idx)
-    
-    def get_events_from_file(self, f, t_start, t_end, use_ms_idx=True):
-        if use_ms_idx and "ms_to_idx" in f:
-            ms_to_idx = f["ms_to_idx"]
-            ms_start =  int(t_start / 1000)
-            ms_end = int(t_end / 1000)
-            start_idx = ms_to_idx[ms_start] if ms_start < len(ms_to_idx) else len(f["events/t"]) -1
-            end_idx = ms_to_idx[ms_end] if ms_end < len(ms_to_idx) else len(f["events/t"])
-        
-        else:
-            # use binary search, mainly for MVSEC while training
-            start_idx = np.searchsorted(f["events/t"], t_start, side = "left")
-            end_idx = np.searchsorted(f["events/t"], t_end, side='right')
-
-        if start_idx > end_idx:
-            return np.array([], dtype = [('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
-        
-        x = f["events/x"][start_idx:end_idx]
-        y = f["events/y"][start_idx:end_idx]
-        t = f["events/t"][start_idx:end_idx]
-        p = f["events/p"][start_idx:end_idx]
-
-        events = np.zeros(len(x), dtype=[('x', 'f4'), ('y', 'f4'), ('t', 'f4'), ('p', 'u1')])
-        
-        events['x'] = x
-        events['y'] = y
-        events['t'] = t
-        events['p'] = p.astype(np.uint8)
-
-        return events
-
-    def normalize_events(self, events, width, height):
-        # Normalize events in the range [0, 1] locally for the batch
-        if  len(events) == 0:
-            return events
-        t_min = events['t'].min()
-        t_max = events['t'].max()
-
-        if t_min == t_max:
-            events['t'] = np.zeros_like(events['t'])
-        else:
-            events['t'] = (events['t'] - t_min) / (t_max - t_min)
-        
-        events['x'] = events['x'] / width
-        events['y'] = events['y'] / height
-
-        return events
-    
-    def find_pose(self, poses, target_time):
-        # Find pose using binary search
-
-        if len(poses) == 0:
-            return np.zeros(7, dtype = np.float32)
-        
-        idx = bisect_left(poses[:, 0], target_time)
-        if idx == 0:
-            return poses[0, 1:].astype(np.float32)
-        elif idx >= len(poses):
-            return poses[-1, 1:].astype(np.float32)
-        else:
-            pose_before = poses[idx - 1]
-            pose_after = poses[idx]
-            if abs(pose_before[0] - target_time) < abs(pose_after[0] - target_time):
-                return pose_before[1:].astype(np.float32)
-            else:
-                return pose_after[1:].astype(np.float32)
-            
-    def chunk_events(self, events, R = 5000, Np = 1024):
-        """
-        chunk events as per Ren et al. CVPR-2024
-        for j in len(E) do
-            Pi.append(ej→l); j = l; where tl - tj = R
-            if (len(Pi) > Np): i = i + 1;
-        """
-
-        if len(events) == 0:
-            return []
-        
-        packets = []
-        j = 0
-
-        while j < len(events):
-            t_start = events['t'][j]
-            l = j
-            while l < len(events) and (events['t'][l] - t_start) <= R:
-                l += 1
-
-            packet = events[j:l].copy()
-
-            if len(packet) > Np:
-                truncated_packet = packet[:Np].copy()
-                packets.append(truncated_packet)
-                j = j + Np # Move to the next unprocessed event without skipping any events
-
-            else:
-                if len(packet) > 0:
-                    packets.append(packet)
-                    j = l # move to the next time window in the same batch of events
-
-        return packets
-
     def __getitem__(self, idx):
-        # Load events on-demand and create packets
         sample_info = self.flat_samples[idx]
-        seq_idx = sample_info['seq_idx']
-        t_start = sample_info['t_start']
-        t_end = sample_info['t_end']
         
-        seq_info = self.sequences[seq_idx]
+        # Load NPZ file
+        npz_path = sample_info['filepath']
+        data = np.load(npz_path)
         
-        # Lazy load events from H5 file
-        left_events = self.get_events(seq_info['left_events_path'], t_start, t_end, seq_info['use_ms_idx'])
-        right_events = self.get_events(seq_info['right_events_path'], t_start, t_end, seq_info['use_ms_idx'])
+        events = data['events']  # Structured array: dtype=[('x','f4'), ('y','f4'), ('t','f4'), ('p','u1')]
+        
+        # Convert structured array to [N, 4] array
+        N = len(events)
+        events_array = np.zeros((N, 4), dtype=np.float32)
+        events_array[:, 0] = events['x']
+        events_array[:, 1] = events['y']
+        events_array[:, 2] = events['t']
+        events_array[:, 3] = events['p'].astype(np.float32)
+        
+        # Pad or truncate to self.N (1024)
+        if N < self.N:
+            # Pad with zeros
+            padded = np.zeros((self.N, 4), dtype=np.float32)
+            padded[:N] = events_array
+            mask = np.zeros(self.N, dtype=bool)
+            mask[:N] = True
+            events_array = padded
+        else:
+            # Truncate
+            events_array = events_array[:self.N]
+            mask = np.ones(self.N, dtype=bool)
+        
+        # Convert to tensors
+        events_tensor = torch.from_numpy(events_array)
+        mask_tensor = torch.from_numpy(mask)
+        
+        return {
+            'events': events_tensor,              # [1024, 4]
+            'mask': mask_tensor,                  # [1024]
+            'sequence': sample_info['sequence'],
+            'position_in_sequence': sample_info['position_in_sequence'],
+            'sequence_length': sample_info['sequence_length'],
+            'time_start': sample_info['time_start'],
+            'time_end': sample_info['time_end'],
+            'time_mid': sample_info['time_mid']
+        }
 
-        R = self.t # time interval
-        Np = self.N
-
-        # Chunk into 1024-event packets
-        left_packets = self.chunk_events(left_events, R, Np)
-        right_packets = self.chunk_events(right_events, R, Np)
-
-        all_samples = []
-        num_packets = min(len(left_packets), len(right_packets))
-
-        for i in range(num_packets):
-            left_chunk = left_packets[i]
-            right_chunk = right_packets[i]
-
-            left_chunk = self.normalize_events(left_chunk, seq_info['width'], seq_info['height'])
-            right_chunk = self.normalize_events(right_chunk, seq_info['width'], seq_info['height'])
-
-            # Mid-time of this packet for pose lookup
-            mid_time = (t_start + t_end) / 2.0
-
-            left_pose = self.find_pose(seq_info['poses'], mid_time)
-            right_pose = self.find_pose(seq_info['poses'], mid_time)
-
-            all_samples.append({
-                'left_events_strip': left_chunk,
-                'right_events_strip': right_chunk,
-                'left_pose': left_pose,
-                'right_pose': right_pose,
-                'left_events_strip_duration': 1.0 if len(left_chunk) > 0 else 0.0,
-                'right_events_strip_duration': 1.0 if len(right_chunk) > 0 else 0.0,
-                'left_packets_count': len(left_packets),
-                'right_packets_count': len(right_packets),
-                'sequence_info': {
-                    'sequence': seq_info['sequence'],
-                    'time_window': (t_start, t_end),
-                    'packet_index': i,
-                    'total_packets': num_packets
-                }
-            })
-
-        return all_samples
 
 def event_extractor(dataset_root, **kwargs):
+    """Factory function to create EventExtractionDataset"""
     return EventExtractionDataset(dataset_root, **kwargs)
 
-if __name__ == "__main__":
-    dataset_root = r"//media/adarsh/One Touch/EventSLAM/dataset/train"
-    dataset = event_extractor(dataset_root)
-    print(f"found {len(dataset)} time samples")
-    
-    # Get the first time sample (which returns a list of packets)
-    packets = dataset[0]
-    print(f"Number of packets in first time sample: {len(packets)}")
-    
-    # Print details about each packet
-    for i, packet in enumerate(packets):
-        print(f"Packet {i}: {len(packet['left_events_strip'])} events")
 
-    if len(packets) > 0:
-        first_packet = packets[0]
-        print(f"\nFirst packet events shape: {first_packet['left_events_strip'].shape}")
-        print(f"First packet pose: {first_packet['left_pose']}")
-        print(f"Sequence info: {first_packet['sequence_info']}")
+if __name__ == "__main__":
+    dataset_root = r"/workspace/npy_cache"
+    
+    print("="*60)
+    print("Testing EventExtractionDataset with Caching")
+    print("="*60)
+    
+    # Test normal mode (will create cache)
+    print("\n--- First run (creates cache) ---")
+    dataset = event_extractor(dataset_root, N=1024, num_workers=16)
+    
+    print(f"\n{'='*60}")
+    print(f"Total samples: {len(dataset)}")
+    print(f"{'='*60}\n")
+    
+    # Test first sample
+    print("Loading first sample...")
+    sample = dataset[0]
+    
+    print(f"\nSample 0:")
+    print(f"  Events shape: {sample['events'].shape}")
+    print(f"  Mask shape: {sample['mask'].shape}")
+    print(f"  Valid events: {sample['mask'].sum().item()}/{len(sample['mask'])}")
+    print(f"  Sequence: {sample['sequence']}")
+    print(f"  Position: {sample['position_in_sequence']}/{sample['sequence_length']}")
+    print(f"  Time: {sample['time_start']:.0f} -> {sample['time_end']:.0f} (mid: {sample['time_mid']:.0f})")
+    
+    # Test cache loading (second run should be instant)
+    print("\n" + "="*60)
+    print("--- Second run (loads from cache) ---")
+    print("="*60)
+    dataset2 = event_extractor(dataset_root, N=1024, num_workers=16)
+    print(f"Loaded {len(dataset2)} samples")
+    
+    # Test debug mode cache
+    print("\n" + "="*60)
+    print("--- Debug mode (separate cache) ---")
+    print("="*60)
+    debug_dataset = event_extractor(dataset_root, N=1024, num_workers=4, debug=True)
+    print(f"Debug dataset samples: {len(debug_dataset)}")
+    
+    print("\n✅ Dataset ready for training!")

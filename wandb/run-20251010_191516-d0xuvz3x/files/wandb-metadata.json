@@ -1,0 +1,26 @@
+{
+  "os":  "Linux-6.14.0-33-generic-x86_64-with-glibc2.39",
+  "python":  "CPython 3.12.11",
+  "startedAt":  "2025-10-10T13:45:16.217099Z",
+  "program":  "-m scripts.triplet_train",
+  "git":  {
+    "remote":  "git@github.com:jha-adarsh18/PEVSLAM.git",
+    "commit":  "590eee04eb026995f83d018a2dd337eb8756e9ea"
+  },
+  "email":  "jhaadarsh350@gmail.com",
+  "root":  "/home/adarsh/PEVSLAM",
+  "host":  "adarsh-ZenBook",
+  "executable":  "/home/adarsh/miniconda3/envs/pevslam/bin/python",
+  "cpu_count":  4,
+  "cpu_count_logical":  8,
+  "disk":  {
+    "/":  {
+      "total":  "269424332800",
+      "used":  "159941939200"
+    }
+  },
+  "memory":  {
+    "total":  "16451129344"
+  },
+  "writerId":  "1pgplqdo75ql0f5ozyyi21n413860wq9"
+}
