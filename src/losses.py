@@ -24,43 +24,43 @@ class VOLoss(nn.Module):
     def epipolar_loss(self, kp1, kp2, matches, R_gt, t_gt, K, resolution):
         B, K1, _ = kp1.shape
         K2 = kp2.shape[1]
-        
+    
         F_mat = self.fundamental_matrix(R_gt, t_gt, K)
-        
+    
         kp1_pixel = kp1 * resolution.unsqueeze(1)
         kp2_pixel = kp2 * resolution.unsqueeze(1)
-        
+    
         kp1_homo = torch.cat([kp1_pixel, torch.ones(B, K1, 1, device=kp1.device)], dim=2)
         kp2_homo = torch.cat([kp2_pixel, torch.ones(B, K2, 1, device=kp2.device)], dim=2)
-        
+    
         match_mask = matches > 0.1
-        
+    
         batch_idx = torch.arange(B, device=kp1.device).view(B, 1, 1).expand(B, K1, K2)
         kp1_idx = torch.arange(K1, device=kp1.device).view(1, K1, 1).expand(B, K1, K2)
         kp2_idx = torch.arange(K2, device=kp1.device).view(1, 1, K2).expand(B, K1, K2)
-        
+    
         valid_matches = match_mask.sum()
         if valid_matches < 5:
             return torch.tensor(0.0, device=kp1.device)
-        
+    
         b_indices = batch_idx[match_mask]
         i_indices = kp1_idx[match_mask]
         j_indices = kp2_idx[match_mask]
-        
+    
         p1_matched = kp1_homo[b_indices, i_indices]
         p2_matched = kp2_homo[b_indices, j_indices]
-        F_matched = F_mat[b_indices]
-        
-        errors = torch.abs(torch.einsum('ni,nij,nj->n', p2_matched, F_matched, p1_matched))
-        
-        return errors.mean()
+        Fmat_matched = F_mat[b_indices]
     
+        errors = torch.abs(torch.einsum('ni,nij,nj->n', p2_matched, Fmat_matched, p1_matched))
+    
+        return errors.mean()
+
     def fundamental_matrix(self, R, t, K):
         B = R.shape[0]
         device = R.device
-        
+    
         t_norm = F.normalize(t, p=2, dim=1)
-        
+    
         t_skew = torch.zeros(B, 3, 3, device=device)
         t_skew[:, 0, 1] = -t_norm[:, 2]
         t_skew[:, 0, 2] = t_norm[:, 1]
@@ -68,12 +68,12 @@ class VOLoss(nn.Module):
         t_skew[:, 1, 2] = -t_norm[:, 0]
         t_skew[:, 2, 0] = -t_norm[:, 1]
         t_skew[:, 2, 1] = t_norm[:, 0]
-        
+    
         E = torch.bmm(t_skew, R)
         K_inv = torch.inverse(K)
-        F = torch.bmm(torch.bmm(K_inv.transpose(1, 2), E), K_inv)
-        
-        return F
+        Fmat = torch.bmm(torch.bmm(K_inv.transpose(1, 2), E), K_inv)
+    
+        return Fmat
     
     def forward(self, predictions, targets):
         R_pred = predictions['R_pred']

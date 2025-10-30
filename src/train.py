@@ -8,6 +8,7 @@ from tqdm import tqdm
 import argparse
 from pathlib import Path
 import json
+import wandb
 
 from dataset import EventVODataset, create_dataloader, collate_fn, worker_init_fn
 from model import EventVO
@@ -21,7 +22,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         events1 = batch['events1'].to(device)
         mask1 = batch['mask1'].to(device)
         events2 = batch['events2'].to(device)
@@ -38,9 +39,17 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
             targets = {'R_gt': R_gt, 't_gt': t_gt, 'K': K, 'resolution': resolution}
             loss, stats = loss_fn(predictions, targets)
         
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"\nNaN/Inf loss detected at batch {batch_idx}!")
+            print(f"Stats: {stats}")
+            print(f"R_pred range: [{predictions['R_pred'].min():.3f}, {predictions['R_pred'].max():.3f}]")
+            print(f"t_pred: {predictions['t_pred'][0]}")
+            print(f"matches sum: {predictions['matches'].sum()}")
+            continue
+        
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         scaler.step(optimizer)
         scaler.update()
         
@@ -54,7 +63,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
             'trans': f"{stats['trans_loss']:.3f}"
         })
     
-    return {k: np.mean(v) for k, v in metrics.items()}
+    return {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in metrics.items()}
 
 
 @torch.no_grad()
@@ -112,8 +121,16 @@ def main():
     parser.add_argument('--save-every', type=int, default=10)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--intrinsics-config', type=str, default='/home/adarsh/PEVSLAM/configs/config.yaml')
+    parser.add_argument('--wandb-project', type=str, default='event-vo')
+    parser.add_argument('--wandb-name', type=str, default=None)
     
     args = parser.parse_args()
+    
+    wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_name,
+        config=vars(args)
+    )
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -123,13 +140,13 @@ def main():
     with open(output_dir / 'config.json', 'w') as f:
         json.dump(vars(args), f, indent=2)
     
-    print("Creating datasets...")
+    print("Creating dataset (loading to RAM once)...")
     full_dataset = EventVODataset(
         args.data_root,
         camera=args.camera,
         dt_range=tuple(args.dt_range),
         n_events=args.n_events,
-        augment=False,
+        augment=True,
         intrinsics_config=args.intrinsics_config
     )
     
@@ -144,26 +161,8 @@ def main():
     train_indices = indices[:n_train]
     val_indices = indices[n_train:]
     
-    train_dataset_base = EventVODataset(
-        args.data_root,
-        camera=args.camera,
-        dt_range=tuple(args.dt_range),
-        n_events=args.n_events,
-        augment=True,
-        intrinsics_config=args.intrinsics_config
-    )
-    
-    val_dataset_base = EventVODataset(
-        args.data_root,
-        camera=args.camera,
-        dt_range=tuple(args.dt_range),
-        n_events=args.n_events,
-        augment=False,
-        intrinsics_config=args.intrinsics_config
-    )
-    
-    train_dataset = torch.utils.data.Subset(train_dataset_base, train_indices)
-    val_dataset = torch.utils.data.Subset(val_dataset_base, val_indices)
+    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
     
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
     
@@ -183,11 +182,12 @@ def main():
     
     model = EventVO(d_model=args.d_model, d_desc=args.d_desc).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    wandb.watch(model, log='all', log_freq=100)
     
     loss_fn = VOLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=1e-6)
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     
     start_epoch = 0
     best_rot_error = float('inf')
@@ -208,12 +208,29 @@ def main():
         train_metrics = train_epoch(model, train_loader, optimizer, loss_fn, scaler, device, epoch)
         scheduler.step()
         
+        wandb.log({
+            'epoch': epoch,
+            'train/loss': train_metrics['loss'],
+            'train/rot_loss': train_metrics['rot_loss'],
+            'train/trans_loss': train_metrics['trans_loss'],
+            'train/epi_loss': train_metrics['epi_loss'],
+            'lr': optimizer.param_groups[0]['lr']
+        })
+        
         print(f"\nEpoch {epoch}: Loss={train_metrics['loss']:.4f}, "
               f"Rot={train_metrics['rot_loss']:.3f}, Trans={train_metrics['trans_loss']:.3f}, "
               f"Epi={train_metrics['epi_loss']:.4f}")
         
         if (epoch + 1) % args.validate_every == 0:
             val_metrics = validate(model, val_loader, device)
+            
+            wandb.log({
+                'epoch': epoch,
+                'val/rot_error_mean': val_metrics['rot_error_mean'],
+                'val/rot_error_median': val_metrics['rot_error_median'],
+                'val/trans_error_mean': val_metrics['trans_error_mean'],
+                'val/trans_error_median': val_metrics['trans_error_median']
+            })
             
             print(f"Val - Rot error: {val_metrics['rot_error_mean']:.2f}° (median: {val_metrics['rot_error_median']:.2f}°)")
             print(f"Val - Trans error: {val_metrics['trans_error_mean']:.2f}° (median: {val_metrics['trans_error_median']:.2f}°)")
@@ -230,6 +247,7 @@ def main():
                     'best_rot_error': best_rot_error,
                 }, output_dir / 'best_model.pth')
                 print(f"✓ Best model saved: Rot={best_rot_error:.2f}°")
+                wandb.save(str(output_dir / 'best_model.pth'))
         
         if (epoch + 1) % args.save_every == 0:
             torch.save({
@@ -242,6 +260,7 @@ def main():
             }, output_dir / f'checkpoint_{epoch:03d}.pth')
     
     print(f"\n✓ Training complete! Best rot error: {best_rot_error:.2f}°")
+    wandb.finish()
 
 
 if __name__ == '__main__':

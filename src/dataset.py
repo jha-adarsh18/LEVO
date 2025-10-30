@@ -1,18 +1,15 @@
 import h5py
+import hdf5plugin
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import yaml
+from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
 
 def worker_init_fn(worker_id):
-    worker_info = torch.utils.data.get_worker_info()
-    if worker_info is not None:
-        dataset = worker_info.dataset
-        if hasattr(dataset, 'dataset'):
-            dataset = dataset.dataset
-        if hasattr(dataset, '_open_h5_files'):
-            dataset._open_h5_files()
+    pass
 
 class EventVODataset(Dataset):
     def __init__(self, data_root, camera='left', dt_range=(50, 200), 
@@ -30,6 +27,9 @@ class EventVODataset(Dataset):
         self.h5_files = {}
         self.pairs = self._build_pairs()
         print(f"Loaded {len(self.pairs)} frame pairs from {len(self.sequences)} sequences")
+        
+        print("Preloading all event data to RAM...")
+        self._open_h5_files()
     
     def _get_intrinsics(self, seq_name):
         seq_lower = seq_name.lower()
@@ -98,17 +98,62 @@ class EventVODataset(Dataset):
         
         return pairs
     
+    def _load_sequence_worker(self, args):
+        seq_name, seq_info = args
+        f = h5py.File(seq_info['event_file'], 'r')
+        
+        ms_to_idx = None
+        if seq_info['has_ms_to_idx'] and 'ms_to_idx' in f:
+            ms_to_idx = np.array(f['ms_to_idx'][:])
+        
+        events_x = np.array(f['events']['x'][:])
+        events_y = np.array(f['events']['y'][:])
+        events_t = np.array(f['events']['t'][:])
+        events_p = np.array(f['events']['p'][:])
+        
+        f.close()
+        
+        n_events = len(events_x)
+        return seq_name, {
+            'events_x': events_x,
+            'events_y': events_y,
+            'events_t': events_t,
+            'events_p': events_p,
+            'ms_to_idx': ms_to_idx,
+            'n_events': n_events
+        }
+    
     def _open_h5_files(self):
-        for seq_name, seq in self.sequences.items():
-            f = h5py.File(seq['event_file'], 'r')
-            self.h5_files[seq_name] = f
+        n_workers = min(32, cpu_count())
+        print(f"Using {n_workers} workers for parallel loading...")
+        
+        with Pool(processes=n_workers) as pool:
+            results = []
+            for seq_name in self.sequences.keys():
+                results.append((seq_name, self.sequences[seq_name]))
             
-            if seq['has_ms_to_idx'] and 'ms_to_idx' in f:
-                self.sequences[seq_name]['ms_to_idx'] = f['ms_to_idx'][:]
+            pbar = tqdm(total=len(results), desc="Loading sequences to RAM", ncols=120)
+            for seq_name, loaded_data in pool.imap_unordered(self._load_sequence_worker, results):
+                self.sequences[seq_name]['events_x'] = loaded_data['events_x']
+                self.sequences[seq_name]['events_y'] = loaded_data['events_y']
+                self.sequences[seq_name]['events_t'] = loaded_data['events_t']
+                self.sequences[seq_name]['events_p'] = loaded_data['events_p']
+                if loaded_data['ms_to_idx'] is not None:
+                    self.sequences[seq_name]['ms_to_idx'] = loaded_data['ms_to_idx']
+                
+                n_events = loaded_data['n_events']
+                size_mb = (n_events * 4 * 4) / (1024 ** 2)
+                
+                pbar.set_postfix_str(f"{seq_name[:20]}: {n_events/1e6:.1f}M events, {size_mb:.1f}MB")
+                pbar.update(1)
+            
+            pbar.close()
+        
+        total_ram = sum(len(seq.get('events_x', [])) * 4 * 4 for seq in self.sequences.values()) / (1024 ** 3)
+        print(f"✓ Loaded {total_ram:.2f} GB to RAM")
 
     def _load_events(self, seq_name, timestamp):
         seq = self.sequences[seq_name]
-        f = self.h5_files[seq_name]
     
         window_us = self.event_window_ms * 1000
         t_start = timestamp - window_us / 2e6
@@ -119,32 +164,21 @@ class EventVODataset(Dataset):
             t_end_ms = int(t_end * 1000)
             
             ms_to_idx = seq['ms_to_idx']
-            start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else len(f['t'])
-            end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(f['t'])
-            
-            x = f['x'][start_idx:end_idx]
-            y = f['y'][start_idx:end_idx]
-            t = f['t'][start_idx:end_idx]
-            p = f['p'][start_idx:end_idx]
+            start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else len(seq['events_t'])
+            end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(seq['events_t'])
         else:
             if not seq['is_mvsec']:
                 t_start *= 1e6
                 t_end *= 1e6
             
-            t_data = f['events/t'] if seq['is_mvsec'] else f['t']
+            t_data = seq['events_t']
             start_idx = np.searchsorted(t_data, t_start)
             end_idx = np.searchsorted(t_data, t_end)
-            
-            if seq['is_mvsec']:
-                x = f['events/x'][start_idx:end_idx]
-                y = f['events/y'][start_idx:end_idx]
-                t = f['events/t'][start_idx:end_idx]
-                p = f['events/p'][start_idx:end_idx]
-            else:
-                x = f['x'][start_idx:end_idx]
-                y = f['y'][start_idx:end_idx]
-                t = f['t'][start_idx:end_idx]
-                p = f['p'][start_idx:end_idx]
+        
+        x = seq['events_x'][start_idx:end_idx]
+        y = seq['events_y'][start_idx:end_idx]
+        t = seq['events_t'][start_idx:end_idx]
+        p = seq['events_p'][start_idx:end_idx]
     
         events = np.stack([x, y, t, p], axis=1).astype(np.float32)
         return events

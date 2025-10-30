@@ -110,7 +110,7 @@ class DescriptorExtractor(nn.Module):
         pos_expanded = positions.unsqueeze(1)
         
         dists = torch.norm(pos_expanded - kp_expanded, dim=-1)
-        local_masks = (dists < self.radius) & mask.unsqueeze(1)
+        local_masks = (dists < self.radius) & mask.unsqueeze(1).bool()
         
         queries = self.query_proj(keypoints)
         
@@ -131,7 +131,7 @@ class DescriptorExtractor(nn.Module):
         local_feats = torch.zeros(B, K, max_local, D, device=event_features.device)
         attn_mask = torch.ones(B, K, max_local, device=event_features.device, dtype=torch.bool)
         
-        counts = torch.zeros(B, K, device=event_features.device, dtype=torch.long)
+        counts = torch.zeros(B * K, device=event_features.device, dtype=torch.long)
         counts.scatter_add_(0, flat_batch * K + flat_kp, torch.ones_like(flat_batch))
         counts = counts.view(B, K).clamp(max=max_local)
         
