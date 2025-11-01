@@ -9,6 +9,7 @@ import argparse
 from pathlib import Path
 import json
 import wandb
+from collections import defaultdict
 
 from dataset import EventVODataset, create_dataloader, collate_fn, worker_init_fn
 from model import EventVO
@@ -18,7 +19,7 @@ from losses import VOLoss
 def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
     model.train()
     metrics = {'loss': [], 'pose_loss': [], 'rot_loss': [], 'trans_loss': [], 
-               'epi_loss': []}
+               'match_loss': [], 'epi_loss': []}
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
@@ -36,7 +37,9 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
         
         with autocast('cuda'):
             predictions = model(events1, mask1, events2, mask2)
-            targets = {'R_gt': R_gt, 't_gt': t_gt, 'K': K, 'resolution': resolution}
+            if batch_idx % 10 == 0:
+                print(f"\nMatch max: {predictions['matches'].max():.6f}, mean: {predictions['matches'].mean():.6f}")
+            targets = {'R_gt': R_gt, 't_gt': t_gt, 'K': K}
             loss, stats = loss_fn(predictions, targets)
         
         if torch.isnan(loss) or torch.isinf(loss):
@@ -60,7 +63,8 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
         pbar.set_postfix({
             'loss': f"{stats['loss']}",
             'rot': f"{stats['rot_loss']}",
-            'trans': f"{stats['trans_loss']}"
+            'trans': f"{stats['trans_loss']}",
+            'match': f"{stats['match_loss']}"
         })
     
     return {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in metrics.items()}
@@ -123,6 +127,7 @@ def main():
     parser.add_argument('--intrinsics-config', type=str, default='/home/adarsh/PEVSLAM/configs/config.yaml')
     parser.add_argument('--wandb-project', type=str, default='event-vo')
     parser.add_argument('--wandb-name', type=str, default=None)
+    parser.add_argument('--num-samples', type=int, default=500)
     
     args = parser.parse_args()
     
@@ -149,28 +154,75 @@ def main():
         augment=True,
         intrinsics_config=args.intrinsics_config
     )
-    
-    n_total = len(full_dataset)
-    n_val = int(n_total * args.val_split)
-    n_train = n_total - n_val
-    
-    indices = np.arange(n_total)
-    np.random.seed(42)
-    np.random.shuffle(indices)
-    
-    train_indices = indices[:n_train]
-    val_indices = indices[n_train:]
-    
+
+    # Sequence-level split for true generalization
+    train_seqs = ['indoor_flying1', 'indoor_flying2', 'indoor_flying3', 
+                  'outdoor_day1', 'outdoor_night1', 'outdoor_night2', 'outdoor_night3']
+    val_seqs = ['indoor_flying4', 'outdoor_day2']
+
+    print(f"Training sequences: {train_seqs}")
+    print(f"Validation sequences: {val_seqs}")
+
+    train_indices = [i for i, (seq, _, _) in enumerate(full_dataset.pairs) if seq in train_seqs]
+    val_indices = [i for i, (seq, _, _) in enumerate(full_dataset.pairs) if seq in val_seqs]
+
+    train_indices = np.array(train_indices)
+    val_indices = np.array(val_indices)
+
     train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
     val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
 
-    # Filter out empty samples from validation
+    # Filter out empty samples from validation - vectorized version
     print("Filtering validation dataset...")
     valid_val_indices = []
-    for i in tqdm(range(len(val_dataset))):
-        sample = val_dataset[i]
-        if sample['mask1'].sum() > 0 and sample['mask2'].sum() > 0:
-            valid_val_indices.append(i)
+    window_us = full_dataset.event_window_ms * 1000
+    
+    # Group validation indices by sequence for batch processing
+    seq_to_local_indices = defaultdict(list)
+    seq_to_pair_info = defaultdict(list)
+    
+    for local_idx in range(len(val_dataset)):
+        global_idx = val_indices[local_idx]
+        seq_name, i, j = full_dataset.pairs[global_idx]
+        seq_to_local_indices[seq_name].append(local_idx)
+        seq_to_pair_info[seq_name].append((i, j))
+    
+    # Process each sequence in batch
+    for seq_name in tqdm(seq_to_local_indices.keys(), desc="Filtering sequences"):
+        seq = full_dataset.sequences[seq_name]
+        local_indices = seq_to_local_indices[seq_name]
+        pair_info = seq_to_pair_info[seq_name]
+        
+        events_t = seq['events_t']
+        timestamps = seq['timestamps']
+        
+        # Vectorize timestamp extraction
+        i_indices = np.array([p[0] for p in pair_info])
+        j_indices = np.array([p[1] for p in pair_info])
+        
+        t1_batch = timestamps[i_indices]
+        t2_batch = timestamps[j_indices]
+        
+        # Vectorize window calculations
+        t1_start = (t1_batch - window_us / 2e6) * 1e6
+        t1_end = (t1_batch + window_us / 2e6) * 1e6
+        t2_start = (t2_batch - window_us / 2e6) * 1e6
+        t2_end = (t2_batch + window_us / 2e6) * 1e6
+        
+        # Batch searchsorted
+        t1_start_idx = np.searchsorted(events_t, t1_start)
+        t1_end_idx = np.searchsorted(events_t, t1_end)
+        t2_start_idx = np.searchsorted(events_t, t2_start)
+        t2_end_idx = np.searchsorted(events_t, t2_end)
+        
+        # Check valid samples
+        n_events1 = t1_end_idx - t1_start_idx
+        n_events2 = t2_end_idx - t2_start_idx
+        
+        valid_mask = (n_events1 > 0) & (n_events2 > 0)
+        valid_val_indices.extend([local_indices[i] for i in np.where(valid_mask)[0]])
+    
+    valid_val_indices = sorted(valid_val_indices)
     val_dataset = torch.utils.data.Subset(val_dataset, valid_val_indices)
     print(f"Validation: {len(val_dataset)} samples (after filtering)")
 
@@ -189,8 +241,8 @@ def main():
         pin_memory=True, persistent_workers=args.num_workers > 0,
         worker_init_fn=worker_init_fn
     )
-    
-    model = EventVO(d_model=args.d_model, d_desc=args.d_desc).to(device)
+
+    model = EventVO(d_model=args.d_model, num_samples=args.num_samples).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     wandb.watch(model, log='all', log_freq=100)
     
@@ -223,13 +275,14 @@ def main():
             'train/loss': train_metrics['loss'],
             'train/rot_loss': train_metrics['rot_loss'],
             'train/trans_loss': train_metrics['trans_loss'],
+            'train/match_loss': train_metrics['match_loss'],
             'train/epi_loss': train_metrics['epi_loss'],
             'lr': optimizer.param_groups[0]['lr']
         })
         
         print(f"\nEpoch {epoch}: Loss={train_metrics['loss']}, "
               f"Rot={train_metrics['rot_loss']}, Trans={train_metrics['trans_loss']}, "
-              f"Epi={train_metrics['epi_loss']}")
+              f"Match={train_metrics['match_loss']}, Epi={train_metrics['epi_loss']}")
         
         if (epoch + 1) % args.validate_every == 0:
             val_metrics = validate(model, val_loader, device)
@@ -242,8 +295,8 @@ def main():
                 'val/trans_error_median': val_metrics['trans_error_median']
             })
             
-            print(f"Val - Rot error: {val_metrics['rot_error_mean']:.2f}° (median: {val_metrics['rot_error_median']:.2f}°)")
-            print(f"Val - Trans error: {val_metrics['trans_error_mean']:.2f}° (median: {val_metrics['trans_error_median']:.2f}°)")
+            print(f"Val - Rot error: {val_metrics['rot_error_mean']}° (median: {val_metrics['rot_error_median']}°)")
+            print(f"Val - Trans error: {val_metrics['trans_error_mean']}° (median: {val_metrics['trans_error_median']}°)")
             
             if val_metrics['rot_error_mean'] < best_rot_error:
                 best_rot_error = val_metrics['rot_error_mean']

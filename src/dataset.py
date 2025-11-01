@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
+import pickle
 
 def worker_init_fn(worker_id):
     pass
@@ -30,6 +31,31 @@ class EventVODataset(Dataset):
         
         print("Preloading all event data to RAM...")
         self._open_h5_files()
+        
+        # Cache file for pre-computed indices
+        cache_file = self.data_root / f'event_indices_cache_{camera}_{event_window_ms}ms_dt{dt_range[0]}-{dt_range[1]}.pkl'
+        
+        if cache_file.exists():
+            print(f"Loading pre-computed indices from cache: {cache_file.name}")
+            with open(cache_file, 'rb') as f:
+                cached_indices = pickle.load(f)
+            
+            # Restore cached indices to sequences
+            for seq_name, indices in cached_indices.items():
+                if seq_name in self.sequences:
+                    self.sequences[seq_name]['event_indices'] = indices
+            print(f"✓ Loaded cached indices for {len(cached_indices)} sequences")
+        else:
+            print("Pre-computing event indices for fast loading (this will take ~1 hour but only happens once)...")
+            self._precompute_event_indices()
+            
+            # Save to cache
+            print(f"Saving pre-computed indices to cache: {cache_file.name}")
+            cached_indices = {seq_name: seq['event_indices'] 
+                             for seq_name, seq in self.sequences.items()}
+            with open(cache_file, 'wb') as f:
+                pickle.dump(cached_indices, f)
+            print("✓ Cached indices saved for future runs")
     
     def _get_intrinsics(self, seq_name):
         seq_lower = seq_name.lower()
@@ -82,7 +108,8 @@ class EventVODataset(Dataset):
                 'is_mvsec': is_mvsec,
                 'resolution': (346, 260) if is_mvsec else (1280, 720),
                 'K': K,
-                'has_ms_to_idx': not is_mvsec
+                'has_ms_to_idx': not is_mvsec,
+                'event_indices': {}  # Cache for pre-computed indices
             }
             
             dt_min_sec = self.dt_range[0] / 1000.0
@@ -110,7 +137,10 @@ class EventVODataset(Dataset):
         events_y = np.array(f['events']['y'][:])
         events_t = np.array(f['events']['t'][:])
         events_p = np.array(f['events']['p'][:])
-        
+
+        events_x = events_x / (1280.0 if not seq_info['is_mvsec'] else 346.0)
+        events_y = events_y / (720.0 if not seq_info['is_mvsec'] else 260.0)
+
         f.close()
         
         n_events = len(events_x)
@@ -152,34 +182,119 @@ class EventVODataset(Dataset):
         total_ram = sum(len(seq.get('events_x', [])) * 4 * 4 for seq in self.sequences.values()) / (1024 ** 3)
         print(f"✓ Loaded {total_ram:.2f} GB to RAM")
 
+    def _precompute_single_sequence(self, args):
+        """Worker function for parallel pre-computation"""
+        seq_name, timestamps_to_compute, seq_info, window_us = args
+        
+        event_indices = {}
+        
+        # Load only events_t for this worker (read-only, safe for multiprocessing)
+        f = h5py.File(seq_info['event_file'], 'r')
+        events_t = np.array(f['events']['t'][:])
+        
+        ms_to_idx = None
+        if seq_info['has_ms_to_idx'] and 'ms_to_idx' in f:
+            ms_to_idx = np.array(f['ms_to_idx'][:])
+        
+        f.close()
+        
+        for t in timestamps_to_compute:
+            t_start = t - window_us / 2e6
+            t_end = t + window_us / 2e6
+            
+            if seq_info['has_ms_to_idx'] and ms_to_idx is not None:
+                t_start_ms = int(t_start * 1000)
+                t_end_ms = int(t_end * 1000)
+                start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else len(events_t)
+                end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(events_t)
+            else:
+                t_start_us = t_start * 1e6
+                t_end_us = t_end * 1e6
+                start_idx = np.searchsorted(events_t, t_start_us)
+                end_idx = np.searchsorted(events_t, t_end_us)
+            
+            event_indices[t] = (start_idx, end_idx)
+        
+        return seq_name, event_indices
+
+    def _precompute_event_indices(self):
+        """Pre-compute event indices for all pairs using parallel processing"""
+        window_us = self.event_window_ms * 1000
+        
+        # Collect all unique timestamps per sequence
+        seq_timestamps = {}
+        for seq_name in self.sequences.keys():
+            seq = self.sequences[seq_name]
+            timestamps = seq['timestamps']
+            
+            unique_timestamps = set()
+            for seq_n, i, j in self.pairs:
+                if seq_n == seq_name:
+                    unique_timestamps.add(timestamps[i])
+                    unique_timestamps.add(timestamps[j])
+            
+            seq_timestamps[seq_name] = list(unique_timestamps)
+        
+        total_timestamps = sum(len(ts) for ts in seq_timestamps.values())
+        print(f"Computing indices for {total_timestamps} unique timestamps across {len(self.sequences)} sequences...")
+        
+        # Prepare tasks for parallel processing
+        tasks = []
+        for seq_name, timestamps in seq_timestamps.items():
+            tasks.append((
+                seq_name,
+                timestamps,
+                self.sequences[seq_name],
+                window_us
+            ))
+        
+        # Use multiprocessing for parallel pre-computation
+        n_workers = min(len(tasks), cpu_count())
+        print(f"Using {n_workers} workers for parallel index computation...")
+        
+        with Pool(processes=n_workers) as pool:
+            pbar = tqdm(total=len(tasks), desc="Pre-computing event indices", ncols=120)
+            
+            for seq_name, event_indices in pool.imap_unordered(self._precompute_single_sequence, tasks):
+                self.sequences[seq_name]['event_indices'] = event_indices
+                n_computed = len(event_indices)
+                pbar.set_postfix_str(f"{seq_name[:25]}: {n_computed} timestamps")
+                pbar.update(1)
+            
+            pbar.close()
+        
+        print(f"✓ Pre-computed {total_timestamps} event index ranges")
+
     def _load_events(self, seq_name, timestamp):
         seq = self.sequences[seq_name]
-    
-        window_us = self.event_window_ms * 1000
-        t_start = timestamp - window_us / 2e6
-        t_end = timestamp + window_us / 2e6
-    
-        if seq['has_ms_to_idx']:
-            t_start_ms = int(t_start * 1000)
-            t_end_ms = int(t_end * 1000)
-            
-            ms_to_idx = seq['ms_to_idx']
-            start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else len(seq['events_t'])
-            end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(seq['events_t'])
+        
+        # Use pre-computed indices (should always exist)
+        if timestamp in seq['event_indices']:
+            start_idx, end_idx = seq['event_indices'][timestamp]
         else:
-            # For MVSEC: timestamps are in seconds, events_t are in microseconds
-            t_start_us = t_start * 1e6
-            t_end_us = t_end * 1e6
+            # Fallback (shouldn't happen if precompute worked)
+            print(f"Warning: timestamp {timestamp} not pre-computed for {seq_name}")
+            window_us = self.event_window_ms * 1000
+            t_start = timestamp - window_us / 2e6
+            t_end = timestamp + window_us / 2e6
             
-            t_data = seq['events_t']
-            start_idx = np.searchsorted(t_data, t_start_us)
-            end_idx = np.searchsorted(t_data, t_end_us)
+            if seq['has_ms_to_idx']:
+                t_start_ms = int(t_start * 1000)
+                t_end_ms = int(t_end * 1000)
+                ms_to_idx = seq['ms_to_idx']
+                start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else len(seq['events_t'])
+                end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(seq['events_t'])
+            else:
+                t_start_us = t_start * 1e6
+                t_end_us = t_end * 1e6
+                start_idx = np.searchsorted(seq['events_t'], t_start_us)
+                end_idx = np.searchsorted(seq['events_t'], t_end_us)
         
         x = seq['events_x'][start_idx:end_idx]
         y = seq['events_y'][start_idx:end_idx]
         t = seq['events_t'][start_idx:end_idx]
         p = seq['events_p'][start_idx:end_idx]
-    
+        
         events = np.stack([x, y, t, p], axis=1).astype(np.float32)
         return events
     
@@ -188,9 +303,6 @@ class EventVODataset(Dataset):
         
         if n == 0:
             return np.zeros((self.n_events, 4), dtype=np.float32), np.zeros(self.n_events, dtype=np.float32)
-        
-        events[:, 0] /= resolution[0]
-        events[:, 1] /= resolution[1]
         
         t_min, t_max = events[:, 2].min(), events[:, 2].max()
         if t_max > t_min:
