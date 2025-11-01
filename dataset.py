@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
+import pickle
 
 def worker_init_fn(worker_id):
     pass
@@ -24,12 +25,29 @@ class EventVODataset(Dataset):
         with open(intrinsics_config, 'r') as f:
             self.intrinsics_config = yaml.safe_load(f)['intrinsics']
         
-        self.h5_files = {}
-        self.pairs = self._build_pairs()
-        print(f"Loaded {len(self.pairs)} frame pairs from {len(self.sequences)} sequences")
+        # CHECK CACHE FIRST - before any H5 loading
+        cache_file = Path(data_root) / f'cache_{camera}_dt{dt_range[0]}-{dt_range[1]}_n{n_events}.pkl'
         
-        print("Preloading all event data to RAM...")
-        self._open_h5_files()
+        if cache_file.exists():
+            print(f"Loading cached data from {cache_file}...")
+            with open(cache_file, 'rb') as f:
+                cached_data = pickle.load(f)
+            self.sequences = cached_data['sequences']
+            self.pairs = cached_data['pairs']
+            print(f"✓ Loaded {len(self.pairs)} pairs from cache")
+        else:
+            print("No cache found. Building dataset from H5 files...")
+            self.sequences = {}
+            self.pairs = self._build_pairs()
+            print(f"Loaded {len(self.pairs)} frame pairs from {len(self.sequences)} sequences")
+            
+            print("Preloading all event data to RAM...")
+            self._open_h5_files()
+            
+            print(f"Saving cache to {cache_file}...")
+            with open(cache_file, 'wb') as f:
+                pickle.dump({'sequences': self.sequences, 'pairs': self.pairs}, f)
+            print("✓ Cache saved")
     
     def _get_intrinsics(self, seq_name):
         seq_lower = seq_name.lower()
@@ -62,7 +80,7 @@ class EventVODataset(Dataset):
                 continue
             
             seq_name = seq_dir.name
-            is_mvsec = 'indoor' in seq_name.lower() or 'outdoor' in seq_name.lower() or 'ourdoor' in seq_name.lower()
+            is_mvsec = 'indoor' in seq_name.lower() or 'outdoor' in seq_name.lower()
             
             event_file = list(seq_dir.glob(f"*{self.camera}*.h5"))[0]
             pose_file = list(seq_dir.glob("*.txt"))[0]
@@ -70,8 +88,8 @@ class EventVODataset(Dataset):
             poses = np.loadtxt(pose_file)
             timestamps = poses[:, 0]
             
-            # Convert all timestamps to seconds for consistency
-            timestamps = timestamps / 1e6
+            if not is_mvsec:
+                timestamps = timestamps / 1e6
             
             K = self._get_intrinsics(seq_name)
             
@@ -167,13 +185,13 @@ class EventVODataset(Dataset):
             start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else len(seq['events_t'])
             end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(seq['events_t'])
         else:
-            # For MVSEC: timestamps are in seconds, events_t are in microseconds
-            t_start_us = t_start * 1e6
-            t_end_us = t_end * 1e6
+            if not seq['is_mvsec']:
+                t_start *= 1e6
+                t_end *= 1e6
             
             t_data = seq['events_t']
-            start_idx = np.searchsorted(t_data, t_start_us)
-            end_idx = np.searchsorted(t_data, t_end_us)
+            start_idx = np.searchsorted(t_data, t_start)
+            end_idx = np.searchsorted(t_data, t_end)
         
         x = seq['events_x'][start_idx:end_idx]
         y = seq['events_y'][start_idx:end_idx]
@@ -253,6 +271,10 @@ class EventVODataset(Dataset):
         
         events1 = self._load_events(seq_name, t1)
         events2 = self._load_events(seq_name, t2)
+        
+        # Skip empty samples - retry with next index
+        if len(events1) < 10 or len(events2) < 10:
+            return self.__getitem__((idx + 1) % len(self))
         
         events1, mask1 = self._process_events(events1, seq['resolution'])
         events2, mask2 = self._process_events(events2, seq['resolution'])
