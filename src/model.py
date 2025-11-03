@@ -115,26 +115,36 @@ class GeometricPoseEstimator(nn.Module):
     def __init__(self, d_model=256):
         super().__init__()
         self.d_model = d_model
+        
+        # Old architecture: simple MLP without attention
+        # Input: concatenated pooled features from feat1 and feat2
+        # Total dim: d_model * 2 = 256 * 2 = 512 -> but checkpoint shows 256 input!
+        # This means the old version used d_model=128, giving 128*2=256 input
         self.mlp = nn.Sequential(
-            nn.Linear(d_model * 2, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 9)
+            nn.Linear(d_model * 2, 256),  # mlp.0
+            nn.ReLU(),                     # mlp.1
+            nn.Linear(256, 128),           # mlp.2
+            nn.ReLU(),                     # mlp.3
+            nn.Linear(128, 9)              # mlp.4
         )
     
     def forward(self, feat1, feat2, match_scores, K):
         B = feat1.shape[0]
         
-        match_weights1 = match_scores.sum(dim=2, keepdim=True) + 1e-8
-        match_weights2 = match_scores.sum(dim=1, keepdim=True).transpose(1, 2) + 1e-8
+        # Simple weighted pooling (no attention)
+        weights1 = match_scores.sum(dim=2, keepdim=True) + 1e-8
+        weights2 = match_scores.sum(dim=1, keepdim=True).transpose(1, 2) + 1e-8
         
-        feat1_pooled = (feat1 * match_weights1).sum(dim=1) / match_weights1.sum(dim=1)
-        feat2_pooled = (feat2 * match_weights2).sum(dim=1) / match_weights2.sum(dim=1)
+        f1_pooled = (feat1 * weights1).sum(dim=1) / weights1.sum(dim=1)
+        f2_pooled = (feat2 * weights2).sum(dim=1) / weights2.sum(dim=1)
         
-        features = torch.cat([feat1_pooled, feat2_pooled], dim=1)
+        # Concatenate pooled features
+        features = torch.cat([f1_pooled, f2_pooled], dim=1)
+        
+        # Predict pose
         pose = self.mlp(features)
         
+        # Split into rotation and translation
         rot_6d = pose[:, :6]
         trans = F.normalize(pose[:, 6:9], p=2, dim=1)
         

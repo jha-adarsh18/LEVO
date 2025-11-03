@@ -12,7 +12,7 @@ class EventBackbone(nn.Module):
         
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=d_model*4,
-            dropout=0.1, activation='gelu', batch_first=True
+            dropout=0.3, activation='gelu', batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
     
@@ -35,16 +35,26 @@ class EventSampler(nn.Module):
         B, N, D = features.shape
         scores = self.score_head(features).squeeze(-1)
         scores = scores.masked_fill(~mask.bool(), float('-inf'))
-        
-        k = min(self.num_samples, mask.sum(dim=1).min().item())
-        if k == 0:
-            return torch.zeros(B, 1, 2, device=features.device), torch.zeros(B, 1, D, device=features.device), torch.zeros(B, 1, device=features.device)
-        
-        topk_scores, topk_indices = torch.topk(scores, k, dim=1)
-        sampled_positions = torch.gather(positions, 1, topk_indices.unsqueeze(-1).expand(-1, -1, 2))
-        sampled_features = torch.gather(features, 1, topk_indices.unsqueeze(-1).expand(-1, -1, D))
-        
-        return sampled_positions, sampled_features, torch.sigmoid(topk_scores)
+    
+        valid_counts = mask.sum(dim=1).int()
+        k_values = torch.clamp(valid_counts, min=10, max=self.num_samples)
+        max_k = k_values.max().item()
+    
+        topk_scores, topk_indices = torch.topk(scores, max_k, dim=1)
+    
+        batch_indices = torch.arange(B, device=features.device).unsqueeze(1).expand(-1, max_k)
+    
+        padded_pos = positions[batch_indices, topk_indices]
+        padded_feat = features[batch_indices, topk_indices]
+        padded_scores = torch.sigmoid(topk_scores)
+    
+        valid_mask = torch.arange(max_k, device=features.device).unsqueeze(0) < k_values.unsqueeze(1)
+    
+        padded_pos = padded_pos * valid_mask.unsqueeze(-1).float()
+        padded_feat = padded_feat * valid_mask.unsqueeze(-1).float()
+        padded_scores = padded_scores * valid_mask.float()
+    
+        return padded_pos, padded_feat, padded_scores
 
 
 class CrossAttentionMatcher(nn.Module):
@@ -102,76 +112,88 @@ class OptimalTransportMatcher(nn.Module):
 
 
 class GeometricPoseEstimator(nn.Module):
-    def __init__(self):
+    def __init__(self, d_model=256):
         super().__init__()
-        self.weight_net = nn.Sequential(
-            nn.Linear(1, 64),
+        self.d_model = d_model
+        
+        self.match_attn = nn.MultiheadAttention(d_model, num_heads=8, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+        
+        self.spatial_scales = [1, 2, 4]
+        self.scale_projs = nn.ModuleList([
+            nn.Linear(d_model, d_model // len(self.spatial_scales))
+            for _ in self.spatial_scales
+        ])
+        
+        total_dim = (d_model // len(self.spatial_scales)) * len(self.spatial_scales) * 2
+        self.mlp = nn.Sequential(
+            nn.Linear(total_dim, 512),
             nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 9)
         )
     
-    def forward(self, pos1, pos2, match_scores, K):
-        B = pos1.shape[0]
-        device = pos1.device
+    def forward(self, feat1, feat2, match_scores, K):
+        B = feat1.shape[0]
         
-        max_matches = match_scores.max(dim=2)[0].max(dim=1)[0]
-        threshold = max_matches * 0.1
+        feat1_attended, attn_weights = self.match_attn(feat1, feat2, feat2)
+        feat1 = self.norm(feat1 + feat1_attended)
         
-        R_pred = []
-        t_pred = []
+        feat2_attended, _ = self.match_attn(feat2, feat1, feat1)
+        feat2 = self.norm(feat2 + feat2_attended)
         
-        for b in range(B):
-            mask = match_scores[b] > threshold[b]
-            i_idx, j_idx = torch.where(mask)
-            
-            if len(i_idx) < 5:
-                R_pred.append(torch.eye(3, device=device))
-                t_pred.append(torch.tensor([0., 0., 1.], device=device))
-                continue
-            
-            pts1 = pos1[b, i_idx]
-            pts2 = pos2[b, j_idx]
-            weights = match_scores[b, i_idx, j_idx]
-            
-            weights = self.weight_net(weights.unsqueeze(-1)).squeeze(-1)
-            weights = weights / (weights.sum() + 1e-8)
-            
-            centroid1 = (pts1 * weights.unsqueeze(-1)).sum(dim=0)
-            centroid2 = (pts2 * weights.unsqueeze(-1)).sum(dim=0)
-            
-            pts1_centered = pts1 - centroid1
-            pts2_centered = pts2 - centroid2
-            
-            H = (pts1_centered.T * weights) @ pts2_centered
-            
-            U, S, Vt = torch.linalg.svd(H)
-            R = Vt.T @ U.T
-            
-            if torch.det(R) < 0:
-                Vt[-1, :] *= -1
-                R = Vt.T @ U.T
-            
-            t = centroid2 - R @ centroid1
-            t = F.normalize(t, p=2, dim=0)
-            
-            R_pred.append(R)
-            t_pred.append(t)
+        pooled_features = []
         
-        R_pred = torch.stack(R_pred)
-        t_pred = torch.stack(t_pred)
+        for scale, proj in zip(self.spatial_scales, self.scale_projs):
+            if scale == 1:
+                weights1 = match_scores.sum(dim=2, keepdim=True) + 1e-8
+                weights2 = match_scores.sum(dim=1, keepdim=True).transpose(1, 2) + 1e-8
+            else:
+                weights1 = match_scores.sum(dim=2, keepdim=True).pow(1.0 / scale) + 1e-8
+                weights2 = match_scores.sum(dim=1, keepdim=True).transpose(1, 2).pow(1.0 / scale) + 1e-8
+            
+            f1_pooled = (proj(feat1) * weights1).sum(dim=1) / weights1.sum(dim=1)
+            f2_pooled = (proj(feat2) * weights2).sum(dim=1) / weights2.sum(dim=1)
+            
+            pooled_features.extend([f1_pooled, f2_pooled])
         
-        return R_pred, t_pred
+        features = torch.cat(pooled_features, dim=1)
+        
+        pose = self.mlp(features)
+        
+        rot_6d = pose[:, :6]
+        trans = F.normalize(pose[:, 6:9], p=2, dim=1)
+        
+        R = self.rotation_6d_to_matrix(rot_6d)
+        
+        return R, trans
+    
+    def rotation_6d_to_matrix(self, x):
+        B = x.shape[0]
+        x = x.view(B, 2, 3)
+        
+        a1 = x[:, 0]
+        a2 = x[:, 1]
+        
+        b1 = F.normalize(a1, dim=1)
+        b2 = a2 - (b1 * a2).sum(dim=1, keepdim=True) * b1
+        b2 = F.normalize(b2, dim=1)
+        b3 = torch.linalg.cross(b1, b2, dim=1)
+        
+        return torch.stack([b1, b2, b3], dim=1)
 
 
 class EventVO(nn.Module):
     def __init__(self, d_model=256, num_samples=500):
         super().__init__()
-        self.backbone = EventBackbone(d_model=d_model)
+        self.backbone = EventBackbone(d_model=d_model, num_layers=2)
         self.sampler = EventSampler(d_model=d_model, num_samples=num_samples)
         self.cross_matcher = CrossAttentionMatcher(d_model=d_model)
         self.matcher = OptimalTransportMatcher(d_desc=d_model)
-        self.pose_estimator = GeometricPoseEstimator()
+        self.pose_estimator = GeometricPoseEstimator(d_model=d_model)
     
     def forward(self, events1, mask1, events2, mask2):
         pos1 = events1[:, :, :2]
@@ -188,7 +210,7 @@ class EventVO(nn.Module):
         matches = self.matcher(desc1, desc2)
         
         K = torch.eye(3, device=events1.device).unsqueeze(0).expand(events1.shape[0], -1, -1)
-        R, t = self.pose_estimator(kp1, kp2, matches, K)
+        R, t = self.pose_estimator(kp_feats1, kp_feats2, matches, K)
         
         return {
             'R_pred': R,

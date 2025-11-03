@@ -20,6 +20,13 @@ intrinsics:
     cx: 170.7684322973841
     cy: 128.18711828338436
     resolution: [346, 260]
+
+  corridor_dolly:
+    fx: 327.32749
+    fy: 327.46184
+    cx: 304.97749
+    cy: 235.37621
+    resolution: [640, 480]
   
   group_D:
     fx: 1049.5830934616608

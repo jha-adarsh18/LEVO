@@ -4,9 +4,10 @@ import torch.nn.functional as F
 
 
 class VOLoss(nn.Module):
-    def __init__(self, w_pose=1.0, w_epipolar=0.1):
+    def __init__(self, w_pose=1.0, w_match=0.0, w_epipolar=0.1):
         super().__init__()
         self.w_pose = w_pose
+        self.w_match = w_match
         self.w_epipolar = w_epipolar
     
     def rotation_loss(self, R_pred, R_gt):
@@ -21,46 +22,80 @@ class VOLoss(nn.Module):
         loss = 1 - cos_sim
         return loss.mean()
     
-    def epipolar_loss(self, kp1, kp2, matches, R_gt, t_gt, K, resolution):
-        B, K1, _ = kp1.shape
-        K2 = kp2.shape[1]
+    def correspondence_loss(self, kp1, kp2, matches, R_gt, t_gt):
+        B, N1, _ = kp1.shape
+        N2 = kp2.shape[1]
+        device = kp1.device
+        
+        threshold = 0.01
+        match_mask = matches > threshold
+        
+        has_matches = match_mask.sum(dim=(1, 2)) >= 3
+        
+        if not has_matches.any():
+            return torch.tensor(0.0, device=device)
+        
+        kp1_expanded = kp1.unsqueeze(2).expand(B, N1, N2, 2)
+        kp2_expanded = kp2.unsqueeze(1).expand(B, N1, N2, 2)
+        
+        pts1_homo = torch.cat([kp1_expanded, torch.ones(B, N1, N2, 1, device=device)], dim=-1)
+        
+        R_gt_expanded = R_gt.unsqueeze(1).unsqueeze(1).expand(B, N1, N2, 3, 3)
+        pts2_transformed = torch.matmul(R_gt_expanded, pts1_homo.unsqueeze(-1)).squeeze(-1)[..., :2]
+        
+        errors = torch.norm(kp2_expanded - pts2_transformed, dim=-1)
+        
+        weighted_errors = errors * matches
+        match_sums = matches.sum(dim=(1, 2))
+        
+        batch_losses = weighted_errors.sum(dim=(1, 2)) / (match_sums + 1e-8)
+        batch_losses = batch_losses * has_matches.float()
+        
+        total_loss = batch_losses.sum() / (has_matches.sum() + 1e-8)
+        
+        return total_loss
     
+    def epipolar_loss(self, kp1, kp2, matches, R_gt, t_gt, K):
+        B, N1, _ = kp1.shape
+        N2 = kp2.shape[1]
+        device = kp1.device
+        
         F_mat = self.fundamental_matrix(R_gt, t_gt, K)
+        
+        threshold = matches.amax(dim=(1, 2), keepdim=True) * 0.1
+        match_mask = matches > threshold
+        
+        has_matches = match_mask.sum(dim=(1, 2)) >= 3
+        
+        if not has_matches.any():
+            return torch.tensor(0.0, device=device)
+        
+        kp1_expanded = kp1.unsqueeze(2).expand(B, N1, N2, 2)
+        kp2_expanded = kp2.unsqueeze(1).expand(B, N1, N2, 2)
+        
+        pts1_homo = torch.cat([kp1_expanded, torch.ones(B, N1, N2, 1, device=device)], dim=-1)
+        pts2_homo = torch.cat([kp2_expanded, torch.ones(B, N1, N2, 1, device=device)], dim=-1)
+        
+        F_mat_expanded = F_mat.unsqueeze(1).unsqueeze(1).expand(B, N1, N2, 3, 3)
+        
+        errors = torch.abs(torch.einsum('bijk,bijk->bij', pts2_homo, torch.matmul(F_mat_expanded, pts1_homo.unsqueeze(-1)).squeeze(-1)))
+        
+        weighted_errors = errors * matches
+        match_sums = matches.sum(dim=(1, 2))
+        
+        batch_losses = weighted_errors.sum(dim=(1, 2)) / (match_sums + 1e-8)
+        batch_losses = batch_losses * has_matches.float()
+        
+        total_loss = batch_losses.sum() / (has_matches.sum() + 1e-8)
+        
+        return total_loss
     
-        kp1_pixel = kp1 * resolution.unsqueeze(1)
-        kp2_pixel = kp2 * resolution.unsqueeze(1)
-    
-        kp1_homo = torch.cat([kp1_pixel, torch.ones(B, K1, 1, device=kp1.device)], dim=2)
-        kp2_homo = torch.cat([kp2_pixel, torch.ones(B, K2, 1, device=kp2.device)], dim=2)
-    
-        match_mask = matches > 0.1
-    
-        batch_idx = torch.arange(B, device=kp1.device).view(B, 1, 1).expand(B, K1, K2)
-        kp1_idx = torch.arange(K1, device=kp1.device).view(1, K1, 1).expand(B, K1, K2)
-        kp2_idx = torch.arange(K2, device=kp1.device).view(1, 1, K2).expand(B, K1, K2)
-    
-        valid_matches = match_mask.sum()
-        if valid_matches < 5:
-            return torch.tensor(0.0, device=kp1.device)
-    
-        b_indices = batch_idx[match_mask]
-        i_indices = kp1_idx[match_mask]
-        j_indices = kp2_idx[match_mask]
-    
-        p1_matched = kp1_homo[b_indices, i_indices]
-        p2_matched = kp2_homo[b_indices, j_indices]
-        Fmat_matched = F_mat[b_indices]
-    
-        errors = torch.abs(torch.einsum('ni,nij,nj->n', p2_matched, Fmat_matched, p1_matched))
-    
-        return errors.mean()
-
     def fundamental_matrix(self, R, t, K):
         B = R.shape[0]
         device = R.device
-    
+        
         t_norm = F.normalize(t, p=2, dim=1)
-    
+        
         t_skew = torch.zeros(B, 3, 3, device=device)
         t_skew[:, 0, 1] = -t_norm[:, 2]
         t_skew[:, 0, 2] = t_norm[:, 1]
@@ -68,11 +103,11 @@ class VOLoss(nn.Module):
         t_skew[:, 1, 2] = -t_norm[:, 0]
         t_skew[:, 2, 0] = -t_norm[:, 1]
         t_skew[:, 2, 1] = t_norm[:, 0]
-    
+        
         E = torch.bmm(t_skew, R)
         K_inv = torch.inverse(K)
         Fmat = torch.bmm(torch.bmm(K_inv.transpose(1, 2), E), K_inv)
-    
+        
         return Fmat
     
     def forward(self, predictions, targets):
@@ -81,26 +116,39 @@ class VOLoss(nn.Module):
         R_gt = targets['R_gt']
         t_gt = targets['t_gt']
         K = targets['K']
-        resolution = targets['resolution']
         
+        # Always compute pose loss
         rot_loss = self.rotation_loss(R_pred, R_gt)
         trans_loss = self.translation_loss(t_pred, t_gt)
         pose_loss = rot_loss + trans_loss
         
-        epi_loss = self.epipolar_loss(
-            predictions['keypoints1'],
-            predictions['keypoints2'],
-            predictions['matches'],
-            R_gt, t_gt, K, resolution
-        )
+        # Only compute expensive geometric losses if their weight is non-zero
+        match_loss = torch.tensor(0.0, device=R_pred.device)
+        if self.w_match > 1e-6:
+            match_loss = self.correspondence_loss(
+                predictions['keypoints1'],
+                predictions['keypoints2'],
+                predictions['matches'],
+                R_gt, t_gt
+            )
         
-        total_loss = self.w_pose * pose_loss + self.w_epipolar * epi_loss
+        epi_loss = torch.tensor(0.0, device=R_pred.device)
+        if self.w_epipolar > 1e-6:
+            epi_loss = self.epipolar_loss(
+                predictions['keypoints1'],
+                predictions['keypoints2'],
+                predictions['matches'],
+                R_gt, t_gt, K
+            )
+        
+        total_loss = self.w_pose * pose_loss + self.w_match * match_loss + self.w_epipolar * epi_loss
         
         stats = {
             'loss': total_loss.item(),
             'pose_loss': pose_loss.item(),
             'rot_loss': rot_loss.item(),
             'trans_loss': trans_loss.item(),
+            'match_loss': match_loss.item(),
             'epi_loss': epi_loss.item()
         }
         
@@ -108,4 +156,5 @@ class VOLoss(nn.Module):
     
     def update_weights(self, epoch, total_epochs):
         progress = epoch / total_epochs
+        self.w_match = 0.5 * (1 + progress)
         self.w_epipolar = 0.1 * (1 + progress * 0.5)

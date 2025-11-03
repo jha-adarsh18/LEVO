@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.amp import autocast, GradScaler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
@@ -16,11 +16,14 @@ from dataset import EventVODataset, create_dataloader, collate_fn, worker_init_f
 from model import EventVO
 from losses import VOLoss
 
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
     model.train()
     metrics = {'loss': [], 'pose_loss': [], 'rot_loss': [], 'trans_loss': [], 
-               'match_loss': [], 'epi_loss': []}
+               'match_loss': [], 'epi_loss': [], 'contrastive_loss': [], 'contrast_max_loss': []}
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
@@ -46,8 +49,14 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
         
         t2 = time.time()
         
-        # Loss computation in FP32
-        targets = {'R_gt': R_gt, 't_gt': t_gt, 'K': K}
+        # Loss computation in FP32 - include events1 and resolution for contrast loss
+        targets = {
+            'R_gt': R_gt, 
+            't_gt': t_gt, 
+            'K': K,
+            'events1': events1,
+            'resolution': resolution
+        }
         loss, stats = loss_fn(predictions, targets)
         t3 = time.time()
         
@@ -78,10 +87,11 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
                     metrics[key].append(stats[key])
         
         pbar.set_postfix({
-            'loss': f"{stats['loss']:.4f}",
-            'rot': f"{stats['rot_loss']:.4f}",
-            'trans': f"{stats['trans_loss']:.4f}",
-            'match': f"{stats['match_loss']:.4f}"
+            'loss': f"{stats['loss']}",
+            'rot': f"{stats['rot_loss']}",
+            'trans': f"{stats['trans_loss']}",
+            'match': f"{stats['match_loss']}",
+            'contr': f"{stats['contrastive_loss']}"
         })
     
     return {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in metrics.items()}
@@ -99,6 +109,10 @@ def validate(model, dataloader, device):
         mask2 = batch['mask2'].to(device)
         R_gt = batch['R_gt'].to(device)
         t_gt = batch['t_gt'].to(device)
+        
+        # Skip batches with no valid events
+        if mask1.sum() == 0 or mask2.sum() == 0:
+            continue
         
         predictions = model(events1, mask1, events2, mask2)
         R_pred = predictions['R_pred']
@@ -128,7 +142,7 @@ def main():
     parser.add_argument('--data-root', type=str, required=True)
     parser.add_argument('--output-dir', type=str, default='./checkpoints_vo')
     parser.add_argument('--batch-size', type=int, default=8)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument('--camera', type=str, default='left')
@@ -145,6 +159,7 @@ def main():
     parser.add_argument('--wandb-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=500)
     parser.add_argument('--prefetch-factor', type=int, default=4)
+    parser.add_argument('--stratified-sampling', action='store_true', help='Use stratified sampling for balanced sequence exposure')
     
     args = parser.parse_args()
     
@@ -189,66 +204,55 @@ def main():
     train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
     val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
 
-    # Filter out empty samples from validation - vectorized version
-    print("Filtering validation dataset...")
-    valid_val_indices = []
-    window_us = full_dataset.event_window_ms * 1000
-    
-    # Group validation indices by sequence for batch processing
-    seq_to_local_indices = defaultdict(list)
-    seq_to_pair_info = defaultdict(list)
-    
-    for local_idx in range(len(val_dataset)):
-        global_idx = val_indices[local_idx]
-        seq_name, i, j = full_dataset.pairs[global_idx]
-        seq_to_local_indices[seq_name].append(local_idx)
-        seq_to_pair_info[seq_name].append((i, j))
-    
-    # Process each sequence in batch
-    for seq_name in tqdm(seq_to_local_indices.keys(), desc="Filtering sequences"):
-        seq = full_dataset.sequences[seq_name]
-        local_indices = seq_to_local_indices[seq_name]
-        pair_info = seq_to_pair_info[seq_name]
-        
-        events_t = seq['events_t']
-        timestamps = seq['timestamps']
-        
-        # Vectorize timestamp extraction
-        i_indices = np.array([p[0] for p in pair_info])
-        j_indices = np.array([p[1] for p in pair_info])
-        
-        t1_batch = timestamps[i_indices]
-        t2_batch = timestamps[j_indices]
-        
-        # Vectorize window calculations
-        t1_start = (t1_batch - window_us / 2e6) * 1e6
-        t1_end = (t1_batch + window_us / 2e6) * 1e6
-        t2_start = (t2_batch - window_us / 2e6) * 1e6
-        t2_end = (t2_batch + window_us / 2e6) * 1e6
-        
-        # Batch searchsorted
-        t1_start_idx = np.searchsorted(events_t, t1_start)
-        t1_end_idx = np.searchsorted(events_t, t1_end)
-        t2_start_idx = np.searchsorted(events_t, t2_start)
-        t2_end_idx = np.searchsorted(events_t, t2_end)
-        
-        # Check valid samples
-        n_events1 = t1_end_idx - t1_start_idx
-        n_events2 = t2_end_idx - t2_start_idx
-        
-        valid_mask = (n_events1 > 0) & (n_events2 > 0)
-        valid_val_indices.extend([local_indices[i] for i in np.where(valid_mask)[0]])
-    
-    valid_val_indices = sorted(valid_val_indices)
-    val_dataset = torch.utils.data.Subset(val_dataset, valid_val_indices)
-    print(f"Validation: {len(val_dataset)} samples (after filtering)")
-
+    # No validation filtering needed with pre-computed indices
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
     
+    # Stratified sampling setup
+    sampler = None
+    shuffle = True
+    
+    if args.stratified_sampling:
+        print("\n=== Setting up stratified sampling ===")
+        # Count samples per sequence
+        seq_counts = defaultdict(int)
+        for idx in train_indices:
+            seq_name, _, _ = full_dataset.pairs[idx]
+            seq_counts[seq_name] += 1
+        
+        print("Sequence distribution:")
+        total_samples = sum(seq_counts.values())
+        for seq_name, count in sorted(seq_counts.items()):
+            print(f"  {seq_name}: {count} samples ({100*count/total_samples:.1f}%)")
+        
+        # Create inverse frequency weights for balanced sampling
+        weights = []
+        for idx in train_indices:
+            seq_name, _, _ = full_dataset.pairs[idx]
+            # Weight inversely proportional to sequence size
+            weights.append(1.0 / seq_counts[seq_name])
+        
+        # Normalize weights
+        weights = np.array(weights)
+        weights = weights / weights.sum() * len(weights)
+        
+        sampler = WeightedRandomSampler(
+            weights=torch.from_numpy(weights),
+            num_samples=len(train_dataset),
+            replacement=True
+        )
+        shuffle = False  # sampler is mutually exclusive with shuffle
+        print("✓ Stratified sampling enabled - each sequence weighted equally")
+        print("=" * 50 + "\n")
+    
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, collate_fn=collate_fn,
-        pin_memory=True, persistent_workers=args.num_workers > 0,
+        train_dataset, 
+        batch_size=args.batch_size, 
+        sampler=sampler,
+        shuffle=shuffle,
+        num_workers=args.num_workers, 
+        collate_fn=collate_fn,
+        pin_memory=True, 
+        persistent_workers=args.num_workers > 0,
         worker_init_fn=worker_init_fn,
         prefetch_factor=args.prefetch_factor
     )
@@ -274,7 +278,8 @@ def main():
     best_rot_error = float('inf')
     
     if args.resume:
-        checkpoint = torch.load(args.resume)
+        # checkpoint = torch.load(args.resume)
+        checkpoint = torch.load(args.resume, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -286,6 +291,11 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         loss_fn.update_weights(epoch, args.epochs)
         
+        # Print current loss weights for transparency
+        if epoch % 5 == 0:
+            print(f"\n[Epoch {epoch}] Loss weights: pose={loss_fn.w_pose:.2f}, match={loss_fn.w_match:.2f}, "
+                  f"epi={loss_fn.w_epipolar:.2f}, contr={loss_fn.w_contrastive:.2f}, cmax={loss_fn.w_contrast_max:.2f}")
+        
         train_metrics = train_epoch(model, train_loader, optimizer, loss_fn, scaler, device, epoch)
         scheduler.step()
         
@@ -296,12 +306,20 @@ def main():
             'train/trans_loss': train_metrics['trans_loss'],
             'train/match_loss': train_metrics['match_loss'],
             'train/epi_loss': train_metrics['epi_loss'],
+            'train/contrastive_loss': train_metrics['contrastive_loss'],
+            'train/contrast_max_loss': train_metrics['contrast_max_loss'],
+            'weights/w_pose': loss_fn.w_pose,
+            'weights/w_match': loss_fn.w_match,
+            'weights/w_epipolar': loss_fn.w_epipolar,
+            'weights/w_contrastive': loss_fn.w_contrastive,
+            'weights/w_contrast_max': loss_fn.w_contrast_max,
             'lr': optimizer.param_groups[0]['lr']
         })
         
-        print(f"\nEpoch {epoch}: Loss={train_metrics['loss']:.4f}, "
-              f"Rot={train_metrics['rot_loss']:.4f}, Trans={train_metrics['trans_loss']:.4f}, "
-              f"Match={train_metrics['match_loss']:.4f}, Epi={train_metrics['epi_loss']:.4f}")
+        print(f"\nEpoch {epoch}: Loss={train_metrics['loss']}, "
+              f"Rot={train_metrics['rot_loss']}, Trans={train_metrics['trans_loss']}, "
+              f"Match={train_metrics['match_loss']}, Epi={train_metrics['epi_loss']}, "
+              f"Contr={train_metrics['contrastive_loss']}, CMax={train_metrics['contrast_max_loss']}")
         
         if (epoch + 1) % args.validate_every == 0:
             val_metrics = validate(model, val_loader, device)
@@ -314,8 +332,8 @@ def main():
                 'val/trans_error_median': val_metrics['trans_error_median']
             })
             
-            print(f"Val - Rot error: {val_metrics['rot_error_mean']:.2f}° (median: {val_metrics['rot_error_median']:.2f}°)")
-            print(f"Val - Trans error: {val_metrics['trans_error_mean']:.2f}° (median: {val_metrics['trans_error_median']:.2f}°)")
+            print(f"Val - Rot error: {val_metrics['rot_error_mean']}° (median: {val_metrics['rot_error_median']}°)")
+            print(f"Val - Trans error: {val_metrics['trans_error_mean']}° (median: {val_metrics['trans_error_median']}°)")
             
             if val_metrics['rot_error_mean'] < best_rot_error:
                 best_rot_error = val_metrics['rot_error_mean']
