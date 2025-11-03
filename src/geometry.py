@@ -60,11 +60,11 @@ def reprojection_residuals(params, points_3d, points_2d, K):
     points_2d = np.ascontiguousarray(points_2d)
     R_mat = R.from_rotvec(params[:3]).as_matrix()
     tvec = params[3:6]
-    points_3d_gpu = torch.from_numpy(points_3d).to(device)
-    points_2d_gpu = torch.from_numpy(points_2d).to(device)
-    R_mat_gpu = torch.from_numpy(R_mat).to(device)
-    tvec_gpu = torch.from_numpy(tvec).to(device)
-    K_gpu = torch.from_numpy(K).to(device)
+    points_3d_gpu = torch.from_numpy(points_3d).double().to(device)
+    points_2d_gpu = torch.from_numpy(points_2d).double().to(device)
+    R_mat_gpu = torch.from_numpy(R_mat).double().to(device)
+    tvec_gpu = torch.from_numpy(tvec).double().to(device)
+    K_gpu = torch.from_numpy(K).double().to(device)
     points_cam_gpu = points_3d_gpu @ R_mat_gpu.T + tvec_gpu
     valid = (points_cam_gpu[:, 2] > 0).cpu().numpy()
     n_pts = len(points_3d)
@@ -84,11 +84,11 @@ def reprojection_residuals(params, points_3d, points_2d, K):
 
 def compute_reprojection_error(R_mat, t_vec, points_3d, points_2d, K):
     points_3d = np.ascontiguousarray(points_3d)
-    points_3d_gpu = torch.from_numpy(points_3d).to(device)
-    R_mat_gpu = torch.from_numpy(R_mat).to(device)
-    t_vec_gpu = torch.from_numpy(t_vec).to(device)
-    K_gpu = torch.from_numpy(K).to(device)
-    points_2d_gpu = torch.from_numpy(points_2d).to(device)
+    points_3d_gpu = torch.from_numpy(points_3d).double().to(device)
+    R_mat_gpu = torch.from_numpy(R_mat).double().to(device)
+    t_vec_gpu = torch.from_numpy(t_vec).double().to(device)
+    K_gpu = torch.from_numpy(K).double().to(device)
+    points_2d_gpu = torch.from_numpy(points_2d).double().to(device)
     points_cam_gpu = points_3d_gpu @ R_mat_gpu.T + t_vec_gpu
     valid = (points_cam_gpu[:, 2] > 0).cpu().numpy()
     errors = np.ones(len(points_3d), dtype=np.float64) * 1e6
@@ -133,9 +133,9 @@ def triangulate_points_cv(points1, points2, K, R, t):
     return points_3d.T
 
 def check_cheirality(points_3d, R, t):
-    points_3d_gpu = torch.from_numpy(np.ascontiguousarray(points_3d)).to(device)
-    R_gpu = torch.from_numpy(R).to(device)
-    t_gpu = torch.from_numpy(t).to(device)
+    points_3d_gpu = torch.from_numpy(np.ascontiguousarray(points_3d)).double().to(device)
+    R_gpu = torch.from_numpy(R).double().to(device)
+    t_gpu = torch.from_numpy(t).double().to(device)
     valid_cam1 = (points_3d_gpu[:, 2] > 0).cpu().numpy()
     points_cam2_gpu = points_3d_gpu @ R_gpu.T + t_gpu
     valid_cam2 = (points_cam2_gpu[:, 2] > 0).cpu().numpy()
