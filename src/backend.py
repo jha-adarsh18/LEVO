@@ -198,10 +198,10 @@ class VOBackend:
         all_pts_3d = np.vstack(all_pts_3d)
         all_pts_2d = np.vstack(all_pts_2d)
         all_poses = np.array(all_poses)
-        all_pts_3d_gpu = torch.from_numpy(np.ascontiguousarray(all_pts_3d)).to(device)
-        all_pts_2d_gpu = torch.from_numpy(np.ascontiguousarray(all_pts_2d)).to(device)
-        R_mats_gpu = torch.from_numpy(all_poses[:, :3, :3]).to(device)
-        t_vecs_gpu = torch.from_numpy(all_poses[:, :3, 3]).to(device)
+        all_pts_3d_gpu = torch.from_numpy(np.ascontiguousarray(all_pts_3d)).double().to(device)
+        all_pts_2d_gpu = torch.from_numpy(np.ascontiguousarray(all_pts_2d)).double().to(device)
+        R_mats_gpu = torch.from_numpy(all_poses[:, :3, :3]).double().to(device)
+        t_vecs_gpu = torch.from_numpy(all_poses[:, :3, 3]).double().to(device)
         pts_cam_gpu = torch.einsum('nij,nj->ni', R_mats_gpu.transpose(1, 2), all_pts_3d_gpu - t_vecs_gpu)
         valid = (pts_cam_gpu[:, 2] > 0).cpu().numpy()
         n_total = len(all_pts_3d)
@@ -209,7 +209,7 @@ class VOBackend:
         if not np.any(valid):
             residuals.fill(10.0)
             return residuals
-        K_gpu = torch.from_numpy(K).to(device)
+        K_gpu = torch.from_numpy(K).double().to(device)
         pts_proj_gpu = (K_gpu @ pts_cam_gpu[valid].T).T
         pts_proj_gpu = pts_proj_gpu[:, :2] / pts_proj_gpu[:, 2:3]
         diff = (pts_proj_gpu - all_pts_2d_gpu[valid]).cpu().numpy()
@@ -222,7 +222,7 @@ class VOBackend:
         return residuals
     
     def _cull_outlier_points_vectorized(self, K):
-        K_gpu = torch.from_numpy(K).to(device)
+        K_gpu = torch.from_numpy(K).double().to(device)
         for kf in self.keyframes:
             valid_indices = [i for i, pid in enumerate(kf.point_ids) 
                            if pid in self.map_points and not self.map_points[pid].outlier]
@@ -234,9 +234,9 @@ class VOBackend:
                 pts_3d[idx] = self.map_points[kf.point_ids[i]].position
             R_mat = kf.pose[:3, :3].T
             t_vec = kf.pose[:3, 3]
-            pts_3d_gpu = torch.from_numpy(pts_3d).to(device)
-            R_mat_gpu = torch.from_numpy(R_mat).to(device)
-            t_vec_gpu = torch.from_numpy(t_vec).to(device)
+            pts_3d_gpu = torch.from_numpy(pts_3d).double().to(device)
+            R_mat_gpu = torch.from_numpy(R_mat).double().to(device)
+            t_vec_gpu = torch.from_numpy(t_vec).double().to(device)
             pts_cam_gpu = pts_3d_gpu @ R_mat_gpu.T - t_vec_gpu @ R_mat_gpu.T
             valid = (pts_cam_gpu[:, 2] > 0).cpu().numpy()
             if not np.any(valid):
@@ -244,7 +244,7 @@ class VOBackend:
             pts_proj_gpu = (K_gpu @ pts_cam_gpu[valid].T).T
             pts_proj_gpu = pts_proj_gpu[:, :2] / pts_proj_gpu[:, 2:3]
             obs_2d = kf.keypoints_2d[np.array(valid_indices)[valid]]
-            obs_2d_gpu = torch.from_numpy(obs_2d).to(device)
+            obs_2d_gpu = torch.from_numpy(obs_2d).double().to(device)
             errors = torch.norm(pts_proj_gpu - obs_2d_gpu, dim=1).cpu().numpy()
             outlier_mask = errors > self.max_reprojection_error
             outlier_indices = np.where(valid)[0][outlier_mask]
