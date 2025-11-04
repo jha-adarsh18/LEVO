@@ -138,6 +138,8 @@ class EventVODataset(Dataset):
         if 't_offset' in f:
             t_offset = f['t_offset'][()][0] / 1e6
             events_t = events_t / 1e6 + t_offset
+        else:
+            events_t = events_t / 1e6
 
         events_x = events_x / (1280.0 if not seq_info['is_mvsec'] else 346.0)
         events_y = events_y / (720.0 if not seq_info['is_mvsec'] else 260.0)
@@ -194,6 +196,8 @@ class EventVODataset(Dataset):
         if 't_offset' in f:
             t_offset = f['t_offset'][()][0] / 1e6
             events_t = events_t / 1e6 + t_offset
+        else:
+            events_t = events_t / 1e6
         
         ms_to_idx = None
         if seq_info['has_ms_to_idx'] and 'ms_to_idx' in f:

@@ -26,7 +26,7 @@ def triangulate_points(kp_left, kp_right, K_left, K_right, baseline, min_dispari
     cy = K_left[:, 1, 2].unsqueeze(1)
     
     depths = (baseline * fx) / (disparities + 1e-8)
-    depths.mul_(valid_mask.float())
+    depths = depths * valid_mask.float()
     
     x = (kp_left[..., 0] - cx) * depths / fx
     y = (kp_left[..., 1] - cy) * depths / fy
@@ -42,7 +42,7 @@ def match_stereo_descriptors(desc_left, desc_right, threshold=0.85, max_disparit
     similarity = torch.bmm(desc_left, desc_right.transpose(1, 2))
     max_sim, matched_indices = similarity.max(dim=2)
     valid_matches = max_sim > threshold
-    matched_indices.mul_(valid_matches.long())
+    matched_indices = matched_indices * valid_matches.long()
     
     return matched_indices, valid_matches
 
@@ -51,36 +51,7 @@ def compute_stereo_scale(kp_left_1, kp_left_2, kp_right_1, kp_right_2,
                          desc_left_1, desc_right_1, K, baseline, min_points=10):
     B = kp_left_1.shape[0]
     device = kp_left_1.device
-    
-    matched_indices, valid_matches = match_stereo_descriptors(desc_left_1, desc_right_1)
-    
-    batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(-1, kp_left_1.shape[1])
-    kp_right_matched = kp_right_1[batch_indices, matched_indices]
-    
-    kp_left_valid = kp_left_1 * valid_matches.unsqueeze(-1).float()
-    kp_right_valid = kp_right_matched * valid_matches.unsqueeze(-1).float()
-    
-    points_3d_1, valid_1 = triangulate_points(kp_left_valid, kp_right_valid, K, K, baseline)
-    valid_1 = valid_1 & valid_matches
-    
-    scales = torch.empty(B, device=device)
-    
-    for b in range(B):
-        valid_pts = points_3d_1[b][valid_1[b]]
-        
-        if valid_pts.shape[0] < min_points:
-            scales[b] = 1.0
-            continue
-        
-        depths = valid_pts[:, 2]
-        depths = depths[depths > 0.1]
-        
-        if len(depths) < min_points:
-            scales[b] = 1.0
-            continue
-        
-        scales[b] = torch.median(depths)
-    
+    scales = torch.ones(B, device=device)
     return scales
 
 

@@ -36,34 +36,19 @@ class VOInference:
         pred_left = self.model(events1_l, mask1_l, events2_l, mask2_l)
         R_pred = pred_left['R_pred'][0]
         t_pred = pred_left['t_pred'][0]
-        if self.use_stereo and events1_r is not None:
-            pred_right = self.model(events1_r, mask1_r, events2_r, mask2_r)
-            scale = self.stereo_processor.recover_scale(pred_left, pred_left, pred_right, pred_right)
-            t_pred = t_pred * scale[0]
-            points_3d, valid_mask = self.stereo_processor.process_stereo_pair(pred_left, pred_right)
-            points_3d = points_3d[0]
-            valid_mask = valid_mask[0]
-        else:
-            points_3d = None
-            valid_mask = None
-        if points_3d is not None and valid_mask.sum() > 10 and K is not None:
-            kp_1 = pred_left['keypoints1'][0]
-            points_3d_valid = points_3d[valid_mask]
-            kp_1_valid = kp_1[valid_mask]
-            R_ransac, t_ransac, inliers = ransac_pnp(
-                points_3d_valid.cpu().numpy(),
-                kp_1_valid.cpu().numpy(),
-                K
-            )
-            if R_ransac is not None and inliers.sum() > 10:
-                R_refined, t_refined = refine_pose_gauss_newton(
-                    R_ransac, t_ransac,
-                    points_3d_valid.cpu().numpy()[inliers],
-                    kp_1_valid.cpu().numpy()[inliers],
-                    K, max_iter=5
-                )
-                R_pred = torch.from_numpy(R_refined).to(R_pred.device)
-                t_pred = torch.from_numpy(t_refined).to(t_pred.device)
+        
+        if self.frame_count > 0 and hasattr(self, 'prev_descriptors'):
+            desc_curr = pred_left['descriptors1'][0]
+            desc_prev = self.prev_descriptors
+            sim = torch.mm(desc_curr, desc_prev.T)
+            max_sim, _ = sim.max(dim=1)
+            match_ratio = (max_sim > 0.7).float().mean().item()
+            print(f"Frame {self.frame_count}: Descriptor match ratio: {match_ratio:.3f}")
+        self.prev_descriptors = pred_left['descriptors1'][0].clone()
+        
+        points_3d = None
+        valid_mask = None
+        
         rel_pose = np.eye(4, dtype=np.float64)
         rel_pose[:3, :3] = R_pred.cpu().numpy()
         rel_pose[:3, 3] = t_pred.cpu().numpy()
