@@ -12,8 +12,11 @@ class VOLoss(nn.Module):
         self.w_contrastive = w_contrastive
     
     def rotation_loss(self, R_pred, R_gt):
+        U, _, Vt = torch.linalg.svd(R_pred)
+        R_pred = torch.bmm(U, Vt)
+        
         trace = torch.einsum('bii->b', torch.bmm(R_pred, R_gt.transpose(1, 2)))
-        geodesic = ((trace - 1) / 2).clamp(-1 + 1e-7, 1 - 1e-7)
+        geodesic = ((trace - 1) / 2).clamp(-1 + 1e-5, 1 - 1e-5)
         loss = 1 - geodesic
         
         ortho_loss = torch.norm(torch.bmm(R_pred, R_pred.transpose(1, 2)) - torch.eye(3, device=R_pred.device).unsqueeze(0), p='fro', dim=(1, 2))
@@ -21,8 +24,9 @@ class VOLoss(nn.Module):
         return loss.mean() + 0.1 * ortho_loss.mean()
     
     def translation_loss(self, t_pred, t_gt):
+        t_pred_norm = F.normalize(t_pred, p=2, dim=1)
         t_gt_norm = F.normalize(t_gt, p=2, dim=1)
-        cos_sim = (t_pred * t_gt_norm).sum(dim=1).clamp(-1 + 1e-7, 1 - 1e-7)
+        cos_sim = (t_pred_norm * t_gt_norm).sum(dim=1).clamp(-1 + 1e-7, 1 - 1e-7)
         loss = torch.acos(cos_sim)
         return loss.mean()
     
@@ -36,7 +40,7 @@ class VOLoss(nn.Module):
         has_matches = match_mask.sum(dim=(1, 2)) >= 3
         
         if not has_matches.any():
-            return torch.tensor(0.0, device=device)
+            return (matches * 0.0).sum()
         
         kp1_expanded = kp1.unsqueeze(2).expand(B, N1, N2, 2)
         kp2_expanded = kp2.unsqueeze(1).expand(B, N1, N2, 2)
@@ -69,7 +73,7 @@ class VOLoss(nn.Module):
         has_matches = match_mask.sum(dim=(1, 2)) >= 3
         
         if not has_matches.any():
-            return torch.tensor(0.0, device=device)
+            return (matches * 0.0).sum()
         
         kp1_expanded = kp1.unsqueeze(2).expand(B, N1, N2, 2)
         kp2_expanded = kp2.unsqueeze(1).expand(B, N1, N2, 2)
@@ -104,7 +108,7 @@ class VOLoss(nn.Module):
         has_positives = positive_mask.sum(dim=(1, 2)) > 0
         
         if not has_positives.any():
-            return torch.tensor(0.0, device=device)
+            return (desc1 * 0.0).sum() + (desc2 * 0.0).sum()
         
         similarity = torch.bmm(desc1, desc2.transpose(1, 2)) / temperature
         positive_sim = similarity * positive_mask.float()
@@ -149,7 +153,7 @@ class VOLoss(nn.Module):
         trans_loss = self.translation_loss(t_pred, t_gt)
         pose_loss = rot_loss + trans_loss
         
-        match_loss = torch.tensor(0.0, device=R_pred.device)
+        match_loss = (R_pred * 0.0).sum()
         if self.w_match > 1e-6:
             match_loss = self.correspondence_loss(
                 predictions['keypoints1'],
@@ -158,7 +162,7 @@ class VOLoss(nn.Module):
                 R_gt, t_gt
             )
         
-        epi_loss = torch.tensor(0.0, device=R_pred.device)
+        epi_loss = (R_pred * 0.0).sum()
         if self.w_epipolar > 1e-6:
             epi_loss = self.epipolar_loss(
                 predictions['keypoints1'],
@@ -167,7 +171,7 @@ class VOLoss(nn.Module):
                 R_gt, t_gt, K
             )
         
-        contrastive_loss = torch.tensor(0.0, device=R_pred.device)
+        contrastive_loss = (R_pred * 0.0).sum()
         if self.w_contrastive > 1e-6:
             contrastive_loss = self.contrastive_loss(
                 predictions['descriptors1'],
@@ -179,9 +183,6 @@ class VOLoss(nn.Module):
                      self.w_match * match_loss + 
                      self.w_epipolar * epi_loss +
                      self.w_contrastive * contrastive_loss)
-        
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
-            total_loss = torch.tensor(0.0, device=R_pred.device, requires_grad=True)
         
         stats = {
             'loss': total_loss.item(),
@@ -196,15 +197,13 @@ class VOLoss(nn.Module):
         return total_loss, stats
     
     def update_weights(self, epoch, total_epochs):
-        progress = epoch / total_epochs
-        
-        if progress < 0.3:
+        if epoch < 20:
             self.w_pose = 1.0
             self.w_match = 0.0
             self.w_epipolar = 0.0
             self.w_contrastive = 0.0
-        elif progress < 0.6:
-            p = (progress - 0.3) / 0.3
+        elif epoch < 35:
+            p = (epoch - 20) / 15
             self.w_pose = 1.0
             self.w_match = 1.5 * p
             self.w_epipolar = 1.0 * p

@@ -342,7 +342,7 @@ class EventVODataset(Dataset):
     
     def _quat_to_rot(self, q):
         q = q / np.linalg.norm(q)
-        w, x, y, z = q
+        x, y, z, w = q
         R = np.array([
             [1-2*(y**2+z**2), 2*(x*y-w*z), 2*(x*z+w*y)],
             [2*(x*y+w*z), 1-2*(x**2+z**2), 2*(y*z-w*x)],

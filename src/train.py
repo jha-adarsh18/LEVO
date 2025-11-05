@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
@@ -19,14 +20,19 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
+def train_epoch(model, dataloader, optimizer, loss_fn, scaler, scheduler, device, epoch):
     model.train()
     metrics = {'loss': [], 'pose_loss': [], 'rot_loss': [], 'trans_loss': [], 
                'match_loss': [], 'epi_loss': [], 'contrastive_loss': []}
     
+    skipped_batches = 0
+    total_batches = 0
+    
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
     for batch_idx, batch in enumerate(pbar):
+        total_batches += 1
+        
         events1 = batch['events1'].to(device, non_blocking=True)
         mask1 = batch['mask1'].to(device, non_blocking=True)
         events2 = batch['events2'].to(device, non_blocking=True)
@@ -44,6 +50,11 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
         loss, stats = loss_fn(predictions, targets)
         
         if torch.isnan(loss) or torch.isinf(loss):
+            skipped_batches += 1
+            pbar.set_postfix({
+                'loss': 'NaN/Inf (skipped)',
+                'skipped': f"{skipped_batches}/{total_batches}"
+            })
             continue
         
         scaler.scale(loss).backward()
@@ -51,6 +62,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()
         
         if batch_idx % 10 == 0:
             for key in metrics.keys():
@@ -60,8 +72,13 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, device, epoch):
         pbar.set_postfix({
             'loss': f"{stats['loss']:.3f}",
             'rot': f"{stats['rot_loss']:.3f}",
-            'trans': f"{stats['trans_loss']:.3f}"
+            'trans': f"{stats['trans_loss']:.3f}",
+            'lr': f"{optimizer.param_groups[0]['lr']:.2e}",
+            'skipped': f"{skipped_batches}/{total_batches}"
         })
+    
+    if skipped_batches > 0:
+        print(f"\n⚠ Skipped {skipped_batches}/{total_batches} batches due to NaN/Inf losses")
     
     return {k: np.mean(v) if len(v) > 0 else 0.0 for k, v in metrics.items()}
 
@@ -112,7 +129,7 @@ def main():
     parser.add_argument('--output-dir', type=str, default='./checkpoints_vo')
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--lr', type=float, default=2e-4)
+    parser.add_argument('--lr', type=float, default=3e-5)
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument('--camera', type=str, default='left')
     parser.add_argument('--dt-range', type=int, nargs=2, default=[50, 200])
@@ -127,6 +144,7 @@ def main():
     parser.add_argument('--num-samples', type=int, default=500)
     parser.add_argument('--prefetch-factor', type=int, default=4)
     parser.add_argument('--stratified-sampling', action='store_true')
+    parser.add_argument('--warmup-steps', type=int, default=2000)
     
     args = parser.parse_args()
     
@@ -210,12 +228,19 @@ def main():
     )
 
     model = EventVO(d_model=args.d_model, num_samples=args.num_samples).to(device)
-    model = torch.compile(model, mode='max-autotune')
     print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     
     loss_fn = VOLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=1e-6)
+    
+    def lr_lambda(step):
+        if step < args.warmup_steps:
+            return step / args.warmup_steps
+        total_steps = args.epochs * len(train_loader)
+        progress = (step - args.warmup_steps) / (total_steps - args.warmup_steps)
+        return max(0.0, 0.5 * (1 + np.cos(np.pi * progress)))
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
     scaler = GradScaler('cuda')
     
     start_epoch = 0
@@ -232,10 +257,15 @@ def main():
         print(f"Resumed from epoch {start_epoch}")
     
     for epoch in range(start_epoch, args.epochs):
-        loss_fn.update_weights(epoch, args.epochs)
+        if epoch < 20:
+            loss_fn.w_pose = 1.0
+            loss_fn.w_match = 0.0
+            loss_fn.w_epipolar = 0.0
+            loss_fn.w_contrastive = 0.0
+        else:
+            loss_fn.update_weights(epoch, args.epochs)
         
-        train_metrics = train_epoch(model, train_loader, optimizer, loss_fn, scaler, device, epoch)
-        scheduler.step()
+        train_metrics = train_epoch(model, train_loader, optimizer, loss_fn, scaler, scheduler, device, epoch)
         
         wandb.log({
             'epoch': epoch,
