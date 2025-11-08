@@ -12,17 +12,14 @@ class VOLoss(nn.Module):
         self.w_contrastive = w_contrastive
     
     def rotation_loss(self, R_pred, R_gt):
-        U, _, Vt = torch.linalg.svd(R_pred)
-        R_pred = torch.bmm(U, Vt)
-        
         trace = torch.einsum('bii->b', torch.bmm(R_pred, R_gt.transpose(1, 2)))
-        geodesic = ((trace - 1) / 2).clamp(-1 + 1e-5, 1 - 1e-5)
+        geodesic = ((trace - 1) / 2).clamp(-0.9999, 0.9999)  # aggressive clamp
         loss = 1 - geodesic
-        
-        ortho_loss = torch.norm(torch.bmm(R_pred, R_pred.transpose(1, 2)) - torch.eye(3, device=R_pred.device).unsqueeze(0), p='fro', dim=(1, 2))
-        
-        return loss.mean() + 0.1 * ortho_loss.mean()
     
+        ortho_loss = torch.norm(torch.bmm(R_pred, R_pred.transpose(1, 2)) - torch.eye(3, device=R_pred.device).unsqueeze(0), p='fro', dim=(1, 2))
+    
+        return loss.mean() + 0.5 * ortho_loss.mean()  # increased from 0.1
+
     def translation_loss(self, t_pred, t_gt):
         t_pred_norm = F.normalize(t_pred, p=2, dim=1)
         t_gt_norm = F.normalize(t_gt, p=2, dim=1)
@@ -202,14 +199,8 @@ class VOLoss(nn.Module):
             self.w_match = 0.0
             self.w_epipolar = 0.0
             self.w_contrastive = 0.0
-        elif epoch < 35:
-            p = (epoch - 20) / 15
-            self.w_pose = 1.0
-            self.w_match = 1.5 * p
-            self.w_epipolar = 1.0 * p
-            self.w_contrastive = 0.5 * p
         else:
             self.w_pose = 1.0
-            self.w_match = 1.5
-            self.w_epipolar = 1.0
-            self.w_contrastive = 0.5
+            self.w_match = 0.05 
+            self.w_epipolar = 0.02  
+            self.w_contrastive = 0.01 

@@ -42,10 +42,30 @@ intrinsics:
       - mocap-desk
       - mocap-desk2
       - skate-easy
-  
-  default:
+
+  group_E:
     fx: 1051.3170714099033
     fy: 1051.7952009807022
     cx: 636.1348547903337
     cy: 265.7059221322115
+    k1: -0.13104704164707634
+    k2: 0.07279844505754081
+    k3: -0.21109298825047648
+    k4: 0.18493426446978858
     resolution: [1280, 720]
+    sequences:
+      - mocap-1d-trans
+      - mocap-3d-trans
+      - mocap-6dof
+      - mocap-shake
+      - mocap-shake2
+      - office-maze
+      - running-easy
+      - running-hard
+      - skate-easy
+      - skate-hard
+      - floor2-dark
+      - slide
+      - bike-easy
+      - bike-hard
+      - bike-dark
