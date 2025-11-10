@@ -292,7 +292,7 @@ def main():
 
     train_seqs = ['indoor_flying1', 'indoor_flying2', 'indoor_flying3', 
                   'outdoor_day1', 'outdoor_night1', 'outdoor_night2', 'outdoor_night3']
-    val_seqs = ['indoor_flying4', 'outdoor_day2', 'loop-floor2', 'skate-easy', 'mocap-desk']
+    val_seqs = ['indoor_flying4', 'outdoor_day2', 'mocap-desk']
     
     group_e_seqs = [
         'mocap-1d-trans', 'mocap-3d-trans', 'mocap-6dof', 'mocap-shake', 'mocap-shake2',

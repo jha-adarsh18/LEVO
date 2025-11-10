@@ -35,13 +35,13 @@ intrinsics:
     cy: 263.46974530961836
     resolution: [1280, 720]
     sequences:
-      - loop-floor0
-      - loop-floor1
-      - loop-floor2
-      - loop-floor3
-      - mocap-desk
-      - mocap-desk2
-      - skate-easy
+      - loop_floor0
+      - loop_floor1
+      - loop_floor2
+      - loop_floor3
+      - mocap_desk
+      - mocap_desk2
+      - skate_easy
 
   group_E:
     fx: 1051.3170714099033
@@ -54,18 +54,18 @@ intrinsics:
     k4: 0.18493426446978858
     resolution: [1280, 720]
     sequences:
-      - mocap-1d-trans
-      - mocap-3d-trans
-      - mocap-6dof
-      - mocap-shake
-      - mocap-shake2
-      - office-maze
-      - running-easy
-      - running-hard
-      - skate-easy
-      - skate-hard
-      - floor2-dark
+      - mocap_1d_trans
+      - mocap_3d_trans
+      - mocap_6dof
+      - mocap_shake
+      - mocap_shake2
+      - office_maze
+      - running_easy
+      - running_hard
+      - skate_easy
+      - skate_hard
+      - floor2_dark
       - slide
-      - bike-easy
-      - bike-hard
-      - bike-dark
+      - bike_easy
+      - bike_hard
+      - bike_night

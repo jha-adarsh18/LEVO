@@ -24,45 +24,45 @@ class EventVODataset(Dataset):
         with open(intrinsics_config, 'r') as f:
             self.intrinsics_config = yaml.safe_load(f)['intrinsics']
         
-        # Build pairs - no longer storing everything in RAM
         self.pairs = self._build_pairs()
         print(f"Loaded {len(self.pairs)} frame pairs from {len(self.sequences)} sequences")
         
-        # Cache file for event indices
-        cache_file = self.data_root / f'event_indices_cache_{camera}_{event_window_ms}ms_dt{dt_range[0]}-{dt_range[1]}.pkl'
-        
-        if cache_file.exists():
-            print(f"Loading pre-computed indices from cache: {cache_file.name}")
-            with open(cache_file, 'rb') as f:
-                self.event_indices_cache = pickle.load(f)
-            print(f"✓ Loaded cached indices")
-        else:
-            print("Pre-computing event indices (this happens once)...")
-            self.event_indices_cache = self._precompute_event_indices()
+        print("Pre-loading and preprocessing all event windows into RAM...")
+        self.preprocessed_events = {}
+        for idx in tqdm(range(len(self.pairs)), desc="Loading events"):
+            seq_name, i, j = self.pairs[idx]
+            seq = self.sequences[seq_name]
             
-            print(f"Saving pre-computed indices to cache: {cache_file.name}")
-            with open(cache_file, 'wb') as f:
-                pickle.dump(self.event_indices_cache, f)
-            print("✓ Cached indices saved")
+            t1 = seq['timestamps'][i]
+            t2 = seq['timestamps'][j]
+            
+            key1 = (seq_name, t1)
+            key2 = (seq_name, t2)
+            
+            if key1 not in self.preprocessed_events:
+                events1 = self._load_events(seq_name, t1)
+                events1, mask1 = self._process_events(events1, seq['resolution'])
+                self.preprocessed_events[key1] = (events1, mask1)
+            
+            if key2 not in self.preprocessed_events:
+                events2 = self._load_events(seq_name, t2)
+                events2, mask2 = self._process_events(events2, seq['resolution'])
+                self.preprocessed_events[key2] = (events2, mask2)
+        
+        print(f"✓ Preloaded {len(self.preprocessed_events)} unique event windows")
     
     def _get_intrinsics(self, seq_name):
-        seq_lower = seq_name.lower()
+        seq_lower = seq_name.lower().replace('_', '-')
         
-        # MVSEC sequences
-        if 'indoor_flying' in seq_lower:
+        if 'indoor-flying' in seq_lower:
             K_params = self.intrinsics_config['indoor_flying']
-        elif 'outdoor_night' in seq_lower:
+        elif 'outdoor-night' in seq_lower:
             K_params = self.intrinsics_config['outdoor_night']
-        elif 'outdoor_day' in seq_lower:
+        elif 'outdoor-day' in seq_lower:
             K_params = self.intrinsics_config['outdoor_day']
-        # TUM-VIE corridor_dolly
-        elif 'corridor' in seq_lower and 'dolly' in seq_lower:
-            K_params = self.intrinsics_config['corridor_dolly']
-        # TUM-VIE Group D (excluded from training)
-        elif any(s in seq_lower for s in self.intrinsics_config['group_D']['sequences']):
+        elif any(s.replace('_', '-') in seq_lower for s in self.intrinsics_config['group_D']['sequences']):
             K_params = self.intrinsics_config['group_D']
-        # TUM-VIE Group E
-        elif any(s in seq_lower for s in self.intrinsics_config['group_E']['sequences']):
+        elif any(s.replace('_', '-') in seq_lower for s in self.intrinsics_config['group_E']['sequences']):
             K_params = self.intrinsics_config['group_E']
         else:
             print(f"Warning: Using default intrinsics for {seq_name}")
@@ -77,9 +77,8 @@ class EventVODataset(Dataset):
         return K
     
     def _is_group_d_sequence(self, seq_name):
-        """Check if sequence belongs to TUM-VIE Group D (to be excluded)"""
-        seq_lower = seq_name.lower()
-        return any(s in seq_lower for s in self.intrinsics_config['group_D']['sequences'])
+        seq_lower = seq_name.lower().replace('_', '-')
+        return any(s.replace('_', '-') in seq_lower for s in self.intrinsics_config['group_D']['sequences'])
     
     def _build_pairs(self):
         self.sequences = {}
@@ -91,15 +90,12 @@ class EventVODataset(Dataset):
             
             seq_name = seq_dir.name
             
-            # Skip Group D sequences
             if self._is_group_d_sequence(seq_name):
                 print(f"Skipping Group D sequence: {seq_name}")
                 continue
             
-            # Determine dataset type
             is_mvsec = 'indoor' in seq_name.lower() or 'outdoor' in seq_name.lower()
             
-            # Find event and pose files
             event_files = list(seq_dir.glob(f"*{self.camera}*.h5"))
             if not event_files:
                 print(f"No event file found for {seq_name}, skipping")
@@ -112,30 +108,22 @@ class EventVODataset(Dataset):
                 continue
             pose_file = pose_files[0]
             
-            # Load poses
             poses = np.loadtxt(pose_file)
             timestamps = poses[:, 0]
             
-            # Convert timestamps to seconds
-            if is_mvsec:
-                timestamps = timestamps / 1e6
+            timestamps = timestamps / 1e6
             
-            # Get intrinsics
             K = self._get_intrinsics(seq_name)
             
-            # Determine resolution
             if is_mvsec:
                 resolution = (346, 260)
             else:
-                # TUM-VIE sequences
-                K_params = None
-                seq_lower = seq_name.lower()
-                if 'corridor' in seq_lower and 'dolly' in seq_lower:
-                    K_params = self.intrinsics_config['corridor_dolly']
-                elif any(s in seq_lower for s in self.intrinsics_config['group_E']['sequences']):
+                seq_lower = seq_name.lower().replace('_', '-')
+                if any(s.replace('_', '-') in seq_lower for s in self.intrinsics_config['group_E']['sequences']):
                     K_params = self.intrinsics_config['group_E']
-                
-                resolution = tuple(K_params['resolution']) if K_params else (1280, 720)
+                    resolution = tuple(K_params['resolution'])
+                else:
+                    resolution = (1280, 720)
             
             self.sequences[seq_name] = {
                 'event_file': str(event_file),
@@ -146,7 +134,6 @@ class EventVODataset(Dataset):
                 'K': K,
             }
             
-            # Build pairs for this sequence
             dt_min_sec = self.dt_range[0] / 1000.0
             dt_max_sec = self.dt_range[1] / 1000.0
             
@@ -159,105 +146,55 @@ class EventVODataset(Dataset):
                     if dt >= dt_min_sec:
                         seq_pairs.append((seq_name, i, j))
             
-            # Sample up to 1000 pairs per sequence
             if len(seq_pairs) > 1000:
-                np.random.seed(42)  # Fixed seed for reproducibility
-                sampled_indices = np.random.choice(len(seq_pairs), 1000, replace=False)
-                seq_pairs = [seq_pairs[idx] for idx in sorted(sampled_indices)]
+                seq_seed = 42 + hash(seq_name) % 1000
+                rng = np.random.RandomState(seq_seed)
+                sampled_indices = rng.choice(len(seq_pairs), 1000, replace=False)
+                seq_pairs = [seq_pairs[idx] for idx in sampled_indices]
             
             all_pairs.extend(seq_pairs)
             print(f"{seq_name}: {len(seq_pairs)} pairs")
         
         return all_pairs
     
-    def _precompute_event_indices(self):
-        """Pre-compute event indices for all pairs"""
-        window_us = self.event_window_ms * 1000
-        event_indices_cache = {}
-        
-        for seq_name in tqdm(self.sequences.keys(), desc="Pre-computing indices"):
-            seq = self.sequences[seq_name]
-            event_indices_cache[seq_name] = {}
-            
-            # Open H5 file temporarily
-            with h5py.File(seq['event_file'], 'r') as f:
-                events_t = np.array(f['events']['t'][:])
-                
-                # Handle time offset
-                if 't_offset' in f:
-                    t_offset = f['t_offset'][()][0] / 1e6
-                    events_t = events_t / 1e6 + t_offset
-                else:
-                    events_t = events_t / 1e6
-                
-                # Check for ms_to_idx
-                has_ms_to_idx = 'ms_to_idx' in f
-                ms_to_idx = np.array(f['ms_to_idx'][:]) if has_ms_to_idx else None
-            
-            # Get unique timestamps for this sequence
-            unique_timestamps = set()
-            for pair_seq_name, i, j in self.pairs:
-                if pair_seq_name == seq_name:
-                    unique_timestamps.add(seq['timestamps'][i])
-                    unique_timestamps.add(seq['timestamps'][j])
-            
-            # Compute indices for each timestamp
-            for t in unique_timestamps:
-                t_start = t - window_us / 2e6
-                t_end = t + window_us / 2e6
-                
-                if has_ms_to_idx and ms_to_idx is not None:
-                    t_start_ms = int(t_start * 1000)
-                    t_end_ms = int(t_end * 1000)
-                    start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else len(events_t)
-                    end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(events_t)
-                else:
-                    start_idx = np.searchsorted(events_t, t_start)
-                    end_idx = np.searchsorted(events_t, t_end)
-                
-                event_indices_cache[seq_name][t] = (start_idx, end_idx)
-        
-        return event_indices_cache
-    
     def _load_events(self, seq_name, timestamp):
-        """Load events on-demand from H5 file"""
         seq = self.sequences[seq_name]
+        window_us = self.event_window_ms * 1000
+        t_start = timestamp - window_us / 2e6
+        t_end = timestamp + window_us / 2e6
         
-        # Get pre-computed indices
-        if seq_name in self.event_indices_cache and timestamp in self.event_indices_cache[seq_name]:
-            start_idx, end_idx = self.event_indices_cache[seq_name][timestamp]
-        else:
-            # Fallback: compute on the fly
-            window_us = self.event_window_ms * 1000
-            t_start = timestamp - window_us / 2e6
-            t_end = timestamp + window_us / 2e6
+        with h5py.File(seq['event_file'], 'r') as f:
+            events_t = np.array(f['events']['t'][:])
             
-            with h5py.File(seq['event_file'], 'r') as f:
-                events_t = np.array(f['events']['t'][:])
-                if 't_offset' in f:
-                    t_offset = f['t_offset'][()][0] / 1e6
-                    events_t = events_t / 1e6 + t_offset
-                else:
-                    events_t = events_t / 1e6
-                
+            if 't_offset' in f:
+                t_offset = f['t_offset'][()][0] / 1e6
+                events_t = events_t / 1e6 + t_offset
+            else:
+                events_t = events_t / 1e6
+            
+            has_ms_to_idx = 'ms_to_idx' in f
+            ms_to_idx = np.array(f['ms_to_idx'][:]) if has_ms_to_idx else None
+            
+            if has_ms_to_idx and ms_to_idx is not None:
+                t_start_ms = int(t_start * 1000)
+                t_end_ms = int(t_end * 1000)
+                start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else len(events_t)
+                end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(events_t)
+            else:
                 start_idx = np.searchsorted(events_t, t_start)
                 end_idx = np.searchsorted(events_t, t_end)
-        
-        # Load events from H5 file
-        with h5py.File(seq['event_file'], 'r') as f:
+            
             events_x = np.array(f['events']['x'][start_idx:end_idx])
             events_y = np.array(f['events']['y'][start_idx:end_idx])
             events_t = np.array(f['events']['t'][start_idx:end_idx])
             events_p = np.array(f['events']['p'][start_idx:end_idx])
             
-            # Handle time offset
             if 't_offset' in f:
                 t_offset = f['t_offset'][()][0] / 1e6
                 events_t = events_t / 1e6 + t_offset
             else:
                 events_t = events_t / 1e6
         
-        # Normalize coordinates
         width, height = seq['resolution']
         events_x = events_x / float(width)
         events_y = events_y / float(height)
@@ -271,23 +208,12 @@ class EventVODataset(Dataset):
         if n == 0:
             return np.zeros((self.n_events, 4), dtype=np.float32), np.zeros(self.n_events, dtype=np.float32)
         
-        # Normalize time within window
         t_min, t_max = events[:, 2].min(), events[:, 2].max()
         if t_max > t_min:
             events[:, 2] = (events[:, 2] - t_min) / (t_max - t_min)
         else:
             events[:, 2] = 0.5
         
-        # Augmentation
-        if self.augment:
-            events[:, :2] += np.random.uniform(-0.03, 0.03, (n, 2))
-            events[:, :2] = np.clip(events[:, :2], 0, 1)
-            events[:, 2] += np.random.uniform(-0.1, 0.1, n)
-            events[:, 2] = np.clip(events[:, 2], 0, 1)
-            if np.random.rand() < 0.1:
-                events[:, 3] = 1 - events[:, 3]
-        
-        # Sample or pad to n_events
         if n > self.n_events:
             indices = np.random.choice(n, self.n_events, replace=False)
             indices = np.sort(indices)
@@ -333,12 +259,33 @@ class EventVODataset(Dataset):
         t1 = seq['timestamps'][i]
         t2 = seq['timestamps'][j]
         
-        # Load events on-demand
-        events1 = self._load_events(seq_name, t1)
-        events2 = self._load_events(seq_name, t2)
+        events1, mask1 = self.preprocessed_events[(seq_name, t1)]
+        events2, mask2 = self.preprocessed_events[(seq_name, t2)]
         
-        events1, mask1 = self._process_events(events1, seq['resolution'])
-        events2, mask2 = self._process_events(events2, seq['resolution'])
+        events1 = events1.copy()
+        events2 = events2.copy()
+        mask1 = mask1.copy()
+        mask2 = mask2.copy()
+        
+        if self.augment:
+            n1 = int(mask1.sum())
+            n2 = int(mask2.sum())
+            
+            if n1 > 0:
+                events1[:n1, :2] += np.random.uniform(-0.03, 0.03, (n1, 2))
+                events1[:n1, :2] = np.clip(events1[:n1, :2], 0, 1)
+                events1[:n1, 2] += np.random.uniform(-0.1, 0.1, n1)
+                events1[:n1, 2] = np.clip(events1[:n1, 2], 0, 1)
+                if np.random.rand() < 0.1:
+                    events1[:n1, 3] = 1 - events1[:n1, 3]
+            
+            if n2 > 0:
+                events2[:n2, :2] += np.random.uniform(-0.03, 0.03, (n2, 2))
+                events2[:n2, :2] = np.clip(events2[:n2, :2], 0, 1)
+                events2[:n2, 2] += np.random.uniform(-0.1, 0.1, n2)
+                events2[:n2, 2] = np.clip(events2[:n2, 2], 0, 1)
+                if np.random.rand() < 0.1:
+                    events2[:n2, 3] = 1 - events2[:n2, 3]
         
         R_rel, t_rel = self._compute_relative_pose(seq['poses'][i], seq['poses'][j])
         
