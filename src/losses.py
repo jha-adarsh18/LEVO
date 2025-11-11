@@ -4,21 +4,23 @@ import torch.nn.functional as F
 
 
 class VOLoss(nn.Module):
-    def __init__(self, w_pose=1.0, w_match=0.0, w_epipolar=0.0, w_contrastive=0.0):
+    def __init__(self, w_rot=1.0, w_trans=10.0, w_match=0.005, w_epipolar=0.002, w_contrastive=0.001):
         super().__init__()
-        self.w_pose = w_pose
+        self.w_rot = w_rot
+        self.w_trans = w_trans
         self.w_match = w_match
         self.w_epipolar = w_epipolar
         self.w_contrastive = w_contrastive
     
     def rotation_loss(self, R_pred, R_gt):
         trace = torch.einsum('bii->b', torch.bmm(R_pred, R_gt.transpose(1, 2)))
-        geodesic = ((trace - 1) / 2).clamp(-0.9999, 0.9999)  # aggressive clamp
+        geodesic = ((trace - 1) / 2).clamp(-0.9999, 0.9999)
         loss = 1 - geodesic
     
         ortho_loss = torch.norm(torch.bmm(R_pred, R_pred.transpose(1, 2)) - torch.eye(3, device=R_pred.device).unsqueeze(0), p='fro', dim=(1, 2))
+        det_loss = torch.abs(torch.det(R_pred) - 1.0)
     
-        return loss.mean() + 0.5 * ortho_loss.mean()  # increased from 0.1
+        return loss.mean() + 0.5 * ortho_loss.mean() + 0.1 * det_loss.mean()
 
     def translation_loss(self, t_pred, t_gt):
         t_pred_norm = F.normalize(t_pred, p=2, dim=1)
@@ -27,7 +29,7 @@ class VOLoss(nn.Module):
         loss = torch.acos(cos_sim)
         return loss.mean()
     
-    def correspondence_loss(self, kp1, kp2, matches, R_gt, t_gt):
+    def correspondence_loss(self, kp1, kp2, matches, R_gt, t_gt, K):
         B, N1, _ = kp1.shape
         N2 = kp2.shape[1]
         device = kp1.device
@@ -39,14 +41,24 @@ class VOLoss(nn.Module):
         if not has_matches.any():
             return (matches * 0.0).sum()
         
-        kp1_expanded = kp1.unsqueeze(2).expand(B, N1, N2, 2)
-        kp2_expanded = kp2.unsqueeze(1).expand(B, N1, N2, 2)
-        pts1_homo = torch.cat([kp1_expanded, torch.ones(B, N1, N2, 1, device=device)], dim=-1)
+        kp1_homo = torch.cat([kp1, torch.ones(B, N1, 1, device=device)], dim=-1)
+        kp2_homo = torch.cat([kp2, torch.ones(B, N2, 1, device=device)], dim=-1)
         
-        R_gt_expanded = R_gt.unsqueeze(1).unsqueeze(1).expand(B, N1, N2, 3, 3)
-        pts2_transformed = torch.matmul(R_gt_expanded, pts1_homo.unsqueeze(-1)).squeeze(-1)[..., :2]
+        K_inv = torch.linalg.inv(K)
+        pts1_norm = torch.bmm(K_inv, kp1_homo.transpose(1, 2)).transpose(1, 2)[..., :2]
+        pts2_norm = torch.bmm(K_inv, kp2_homo.transpose(1, 2)).transpose(1, 2)[..., :2]
         
-        errors = torch.norm(kp2_expanded - pts2_transformed, dim=-1)
+        pts1_expanded = pts1_norm.unsqueeze(2).expand(B, N1, N2, 2)
+        pts2_expanded = pts2_norm.unsqueeze(1).expand(B, N1, N2, 2)
+        
+        pts1_homo_3d = torch.cat([pts1_expanded, torch.ones(B, N1, N2, 1, device=device)], dim=-1)
+        R_expanded = R_gt.unsqueeze(1).unsqueeze(1).expand(B, N1, N2, 3, 3)
+        t_expanded = t_gt.unsqueeze(1).unsqueeze(1).expand(B, N1, N2, 3)
+        
+        pts1_transformed = torch.matmul(R_expanded, pts1_homo_3d.unsqueeze(-1)).squeeze(-1) + t_expanded
+        pts1_proj = pts1_transformed[..., :2] / (pts1_transformed[..., 2:3] + 1e-8)
+        
+        errors = torch.norm(pts2_expanded - pts1_proj, dim=-1)
         weighted_errors = errors * matches
         match_sums = matches.sum(dim=(1, 2))
         
@@ -148,7 +160,7 @@ class VOLoss(nn.Module):
         
         rot_loss = self.rotation_loss(R_pred, R_gt)
         trans_loss = self.translation_loss(t_pred, t_gt)
-        pose_loss = rot_loss + trans_loss
+        pose_loss = self.w_rot * rot_loss + self.w_trans * trans_loss
         
         match_loss = (R_pred * 0.0).sum()
         if self.w_match > 1e-6:
@@ -156,7 +168,7 @@ class VOLoss(nn.Module):
                 predictions['keypoints1'],
                 predictions['keypoints2'],
                 predictions['matches'],
-                R_gt, t_gt
+                R_gt, t_gt, K
             )
         
         epi_loss = (R_pred * 0.0).sum()
@@ -176,7 +188,7 @@ class VOLoss(nn.Module):
                 predictions['matches']
             )
         
-        total_loss = (self.w_pose * pose_loss + 
+        total_loss = (pose_loss + 
                      self.w_match * match_loss + 
                      self.w_epipolar * epi_loss +
                      self.w_contrastive * contrastive_loss)
@@ -192,15 +204,3 @@ class VOLoss(nn.Module):
         }
         
         return total_loss, stats
-    
-    def update_weights(self, epoch, total_epochs):
-        if epoch < 20:
-            self.w_pose = 1.0
-            self.w_match = 0.0
-            self.w_epipolar = 0.0
-            self.w_contrastive = 0.0
-        else:
-            self.w_pose = 1.0
-            self.w_match = 0.05 
-            self.w_epipolar = 0.02  
-            self.w_contrastive = 0.01 

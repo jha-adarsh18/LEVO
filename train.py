@@ -59,7 +59,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, scheduler, device
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
@@ -88,155 +88,64 @@ def validate(model, dataloader, device):
     rot_errors = []
     trans_errors = []
     
-    debug_file = Path('validation_debug.txt')
-    with open(debug_file, 'w') as f:
-        f.write("=== Validation Debug Log ===\n\n")
+    for batch in tqdm(dataloader, desc="Validation"):
+        events1 = batch['events1'].to(device, non_blocking=True)
+        mask1 = batch['mask1'].to(device, non_blocking=True)
+        events2 = batch['events2'].to(device, non_blocking=True)
+        mask2 = batch['mask2'].to(device, non_blocking=True)
+        R_gt = batch['R_gt'].to(device, non_blocking=True)
+        t_gt = batch['t_gt'].to(device, non_blocking=True)
+        K = batch['K'].to(device, non_blocking=True)
         
-        batch_count = 0
-        for batch in tqdm(dataloader, desc="Validation"):
-            events1 = batch['events1'].to(device, non_blocking=True)
-            mask1 = batch['mask1'].to(device, non_blocking=True)
-            events2 = batch['events2'].to(device, non_blocking=True)
-            mask2 = batch['mask2'].to(device, non_blocking=True)
-            R_gt = batch['R_gt'].to(device, non_blocking=True)
-            t_gt = batch['t_gt'].to(device, non_blocking=True)
-            K = batch['K'].to(device, non_blocking=True)
+        if mask1.sum() == 0 or mask2.sum() == 0:
+            continue
+        
+        predictions = model(events1, mask1, events2, mask2, K)
+        R_pred = predictions['R_pred']
+        t_pred = predictions['t_pred']
+        
+        t_pred_norm = F.normalize(t_pred, p=2, dim=1)
+        t_gt_norm = F.normalize(t_gt, p=2, dim=1)
+        
+        for i in range(R_pred.shape[0]):
+            R_pred_i = R_pred[i]
+            R_gt_i = R_gt[i]
             
-            f.write(f"\n{'='*60}\n")
-            f.write(f"Batch {batch_count}\n")
-            f.write(f"mask1 sum: {mask1.sum().item()}, mask2 sum: {mask2.sum().item()}\n")
-            
-            if mask1.sum() == 0 or mask2.sum() == 0:
-                f.write("SKIPPED: Empty masks\n")
-                batch_count += 1
+            if torch.isnan(R_pred_i).any() or torch.isnan(R_gt_i).any():
                 continue
             
-            predictions = model(events1, mask1, events2, mask2, K)
-            R_pred = predictions['R_pred']
-            t_pred = predictions['t_pred']
+            if torch.isinf(R_pred_i).any() or torch.isinf(R_gt_i).any():
+                continue
             
-            f.write(f"\nR_pred shape: {R_pred.shape}\n")
-            f.write(f"R_pred stats: min={R_pred.min().item():.6f}, max={R_pred.max().item():.6f}, mean={R_pred.mean().item():.6f}\n")
-            f.write(f"R_pred has NaN: {torch.isnan(R_pred).any().item()}\n")
-            f.write(f"R_pred has Inf: {torch.isinf(R_pred).any().item()}\n")
+            trace = torch.trace(R_pred_i @ R_gt_i.T)
             
-            f.write(f"\nt_pred shape: {t_pred.shape}\n")
-            f.write(f"t_pred stats: min={t_pred.min().item():.6f}, max={t_pred.max().item():.6f}, mean={t_pred.mean().item():.6f}\n")
-            f.write(f"t_pred has NaN: {torch.isnan(t_pred).any().item()}\n")
-            f.write(f"t_pred has Inf: {torch.isinf(t_pred).any().item()}\n")
+            if torch.isnan(trace):
+                continue
             
-            f.write(f"\nR_gt stats: min={R_gt.min().item():.6f}, max={R_gt.max().item():.6f}\n")
-            f.write(f"R_gt has NaN: {torch.isnan(R_gt).any().item()}\n")
+            if trace < -1.1 or trace > 3.1:
+                continue
             
-            f.write(f"\nt_gt stats: min={t_gt.min().item():.6f}, max={t_gt.max().item():.6f}\n")
-            f.write(f"t_gt has NaN: {torch.isnan(t_gt).any().item()}\n")
+            trace_val = (trace - 1) / 2
+            trace_clamped = torch.clamp(trace_val, -0.9999, 0.9999)
+            rot_error = torch.acos(trace_clamped)
             
-            t_gt_norm = F.normalize(t_gt, p=2, dim=1)
+            if torch.isnan(rot_error):
+                continue
             
-            f.write(f"\n--- Per-sample analysis ---\n")
-            for i in range(R_pred.shape[0]):
-                f.write(f"\nSample {i}:\n")
-                
-                R_pred_i = R_pred[i]
-                R_gt_i = R_gt[i]
-                
-                f.write(f"  R_pred[{i}] has NaN: {torch.isnan(R_pred_i).any().item()}\n")
-                f.write(f"  R_pred[{i}] has Inf: {torch.isinf(R_pred_i).any().item()}\n")
-                
-                det_pred = torch.det(R_pred_i)
-                f.write(f"  det(R_pred[{i}]): {det_pred.item():.6f}\n")
-                
-                ortho_check = torch.norm(R_pred_i @ R_pred_i.T - torch.eye(3, device=device))
-                f.write(f"  orthogonality error: {ortho_check.item():.6f}\n")
-                
-                if torch.isnan(R_pred_i).any() or torch.isnan(R_gt_i).any():
-                    f.write(f"  SKIP: NaN in rotation matrices\n")
-                    continue
-                
-                if torch.isinf(R_pred_i).any() or torch.isinf(R_gt_i).any():
-                    f.write(f"  SKIP: Inf in rotation matrices\n")
-                    continue
-                
-                trace = torch.trace(R_pred_i @ R_gt_i.T)
-                f.write(f"  trace(R_pred @ R_gt.T): {trace.item():.6f}\n")
-                
-                if torch.isnan(trace):
-                    f.write(f"  SKIP: trace is NaN\n")
-                    continue
-                
-                if trace < -1.1 or trace > 3.1:
-                    f.write(f"  SKIP: trace out of valid range [-1, 3]\n")
-                    continue
-                
-                trace_val = (trace - 1) / 2
-                f.write(f"  (trace - 1) / 2: {trace_val.item():.6f}\n")
-                
-                trace_clamped = torch.clamp(trace_val, -0.9999, 0.9999)
-                f.write(f"  clamped value: {trace_clamped.item():.6f}\n")
-                
-                rot_error = torch.acos(trace_clamped)
-                f.write(f"  rot_error (rad): {rot_error.item():.6f}\n")
-                f.write(f"  rot_error (deg): {rot_error.item() * 180 / np.pi:.6f}\n")
-                
-                if torch.isnan(rot_error):
-                    f.write(f"  SKIP: rot_error is NaN\n")
-                    continue
-                
-                rot_errors.append(rot_error.item() * 180 / np.pi)
-                f.write(f"  ✓ Added to rot_errors\n")
-                
-                cos_sim = (t_pred[i] * t_gt_norm[i]).sum()
-                f.write(f"  cos_sim(t_pred, t_gt): {cos_sim.item():.6f}\n")
-                
-                if torch.isnan(cos_sim):
-                    f.write(f"  SKIP: cos_sim is NaN\n")
-                    continue
-                
-                cos_clamped = torch.clamp(cos_sim, -0.9999, 0.9999)
-                trans_error = torch.acos(cos_clamped)
-                f.write(f"  trans_error (rad): {trans_error.item():.6f}\n")
-                f.write(f"  trans_error (deg): {trans_error.item() * 180 / np.pi:.6f}\n")
-                
-                if torch.isnan(trans_error):
-                    f.write(f"  SKIP: trans_error is NaN\n")
-                    continue
-                
-                trans_errors.append(trans_error.item() * 180 / np.pi)
-                f.write(f"  ✓ Added to trans_errors\n")
+            rot_errors.append(rot_error.item() * 180 / np.pi)
             
-            batch_count += 1
-        
-        f.write(f"\n\n{'='*60}\n")
-        f.write(f"SUMMARY\n")
-        f.write(f"{'='*60}\n")
-        f.write(f"Total batches processed: {batch_count}\n")
-        f.write(f"Collected {len(rot_errors)} rotation errors\n")
-        f.write(f"Collected {len(trans_errors)} translation errors\n")
-        
-        if len(rot_errors) > 0:
-            f.write(f"\nRotation errors:\n")
-            f.write(f"  mean: {np.mean(rot_errors):.6f}°\n")
-            f.write(f"  median: {np.median(rot_errors):.6f}°\n")
-            f.write(f"  min: {np.min(rot_errors):.6f}°\n")
-            f.write(f"  max: {np.max(rot_errors):.6f}°\n")
-            f.write(f"  std: {np.std(rot_errors):.6f}°\n")
-            f.write(f"  NaN count: {sum(np.isnan(rot_errors))}\n")
-        else:
-            f.write(f"\nNo valid rotation errors collected!\n")
-        
-        if len(trans_errors) > 0:
-            f.write(f"\nTranslation errors:\n")
-            f.write(f"  mean: {np.mean(trans_errors):.6f}°\n")
-            f.write(f"  median: {np.median(trans_errors):.6f}°\n")
-            f.write(f"  min: {np.min(trans_errors):.6f}°\n")
-            f.write(f"  max: {np.max(trans_errors):.6f}°\n")
-            f.write(f"  std: {np.std(trans_errors):.6f}°\n")
-            f.write(f"  NaN count: {sum(np.isnan(trans_errors))}\n")
-        else:
-            f.write(f"\nNo valid translation errors collected!\n")
-    
-    print(f"Collected {len(rot_errors)} rotation errors, {len(trans_errors)} translation errors")
-    print(f"Debug info written to {debug_file}")
+            cos_sim = (t_pred_norm[i] * t_gt_norm[i]).sum()
+            
+            if torch.isnan(cos_sim):
+                continue
+            
+            cos_clamped = torch.clamp(cos_sim, -0.9999, 0.9999)
+            trans_error = torch.acos(cos_clamped)
+            
+            if torch.isnan(trans_error):
+                continue
+            
+            trans_errors.append(trans_error.item() * 180 / np.pi)
     
     return {
         'rot_error_mean': np.mean(rot_errors) if len(rot_errors) > 0 else float('nan'),
@@ -258,7 +167,7 @@ def main():
     parser.add_argument('--dt-range', type=int, nargs=2, default=[50, 200])
     parser.add_argument('--n-events', type=int, default=2048)
     parser.add_argument('--d-model', type=int, default=256)
-    parser.add_argument('--validate-every', type=int, default=5)
+    parser.add_argument('--validate-every', type=int, default=2)
     parser.add_argument('--save-every', type=int, default=10)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--intrinsics-config', type=str, default='/home/adarsh/PEVSLAM/configs/config.yaml')
@@ -268,6 +177,12 @@ def main():
     parser.add_argument('--prefetch-factor', type=int, default=4)
     parser.add_argument('--stratified-sampling', action='store_true')
     parser.add_argument('--warmup-steps', type=int, default=2000)
+    parser.add_argument('--w-rot', type=float, default=1.0)
+    parser.add_argument('--w-trans', type=float, default=10.0)
+    parser.add_argument('--w-match-final', type=float, default=0.01)
+    parser.add_argument('--w-epipolar-final', type=float, default=0.005)
+    parser.add_argument('--w-contrastive-final', type=float, default=0.005)
+    parser.add_argument('--ramp-epochs', type=int, default=30)
     
     args = parser.parse_args()
     
@@ -292,25 +207,35 @@ def main():
 
     train_seqs = ['indoor_flying1', 'indoor_flying2', 'indoor_flying3', 
                   'outdoor_day1', 'outdoor_night1', 'outdoor_night2', 'outdoor_night3']
-    val_seqs = ['indoor_flying4', 'outdoor_day2']
-
-    train_indices = [i for i, (seq, _, _) in enumerate(full_dataset.pairs) if seq in train_seqs]
-    val_indices = [i for i, (seq, _, _) in enumerate(full_dataset.pairs) if seq in val_seqs]
-
+    val_seqs = ['indoor_flying4', 'outdoor_day2', 'mocap-desk']
+    
+    group_e_seqs = [
+        'mocap-1d-trans', 'mocap-3d-trans', 'mocap-6dof', 'mocap-shake', 'mocap-shake2',
+        'office-maze', 'running-easy', 'running-hard', 'skate-easy', 'skate-hard',
+        'floor2-dark', 'slide', 'bike-easy', 'bike-hard', 'bike-dark'
+    ]
+    train_seqs.extend(group_e_seqs)
+    
+    train_indices = []
+    val_indices = []
+    
+    for i, (seq, _, _) in enumerate(full_dataset.pairs):
+        seq_lower = seq.lower().replace('_', '-')
+        is_train = any(train_seq.lower().replace('_', '-') in seq_lower for train_seq in train_seqs)
+        is_val = any(val_seq.lower().replace('_', '-') in seq_lower for val_seq in val_seqs)
+        
+        if is_val:
+            val_indices.append(i)
+        elif is_train:
+            train_indices.append(i)
+    
     train_indices = np.array(train_indices)
     val_indices = np.array(val_indices)
 
     train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
     val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
 
-    max_pairs = 5000
-    if len(train_dataset) > max_pairs:
-        np.random.seed(42)
-        subset_idx = np.random.choice(len(train_dataset), max_pairs, replace=False)
-        train_dataset = torch.utils.data.Subset(train_dataset, subset_idx)
-        print(f"Subsampled training to {max_pairs} pairs")
-
-    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    print(f"Train: {len(train_dataset)} pairs, Val: {len(val_dataset)} pairs")
     
     sampler = None
     shuffle = True
@@ -360,7 +285,13 @@ def main():
     model = EventVO(d_model=args.d_model, num_samples=args.num_samples).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     
-    loss_fn = VOLoss()
+    loss_fn = VOLoss(
+        w_rot=args.w_rot,
+        w_trans=args.w_trans,
+        w_match=0.005,
+        w_epipolar=0.002,
+        w_contrastive=0.001
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     
     def lr_lambda(step):
@@ -387,13 +318,10 @@ def main():
         print(f"Resumed from epoch {start_epoch}")
     
     for epoch in range(start_epoch, args.epochs):
-        if epoch < 20:
-            loss_fn.w_pose = 1.0
-            loss_fn.w_match = 0.0
-            loss_fn.w_epipolar = 0.0
-            loss_fn.w_contrastive = 0.0
-        else:
-            loss_fn.update_weights(epoch, args.epochs)
+        progress = min(1.0, epoch / args.ramp_epochs)
+        loss_fn.w_match = 0.005 + progress * (args.w_match_final - 0.005)
+        loss_fn.w_epipolar = 0.002 + progress * (args.w_epipolar_final - 0.002)
+        loss_fn.w_contrastive = 0.001 + progress * (args.w_contrastive_final - 0.001)
         
         train_metrics = train_epoch(model, train_loader, optimizer, loss_fn, scaler, scheduler, device, epoch)
         
@@ -405,7 +333,12 @@ def main():
             'train/match_loss': train_metrics['match_loss'],
             'train/epi_loss': train_metrics['epi_loss'],
             'train/contrastive_loss': train_metrics['contrastive_loss'],
-            'lr': optimizer.param_groups[0]['lr']
+            'lr': optimizer.param_groups[0]['lr'],
+            'w_rot': loss_fn.w_rot,
+            'w_trans': loss_fn.w_trans,
+            'w_match': loss_fn.w_match,
+            'w_epipolar': loss_fn.w_epipolar,
+            'w_contrastive': loss_fn.w_contrastive
         })
         
         print(f"\nEpoch {epoch}: Loss={train_metrics['loss']:.3f}, "
@@ -425,8 +358,8 @@ def main():
             print(f"Val - Rot: {val_metrics['rot_error_mean']:.2f}° (median: {val_metrics['rot_error_median']:.2f}°)")
             print(f"Val - Trans: {val_metrics['trans_error_mean']:.2f}° (median: {val_metrics['trans_error_median']:.2f}°)")
             
-            if val_metrics['rot_error_mean'] < best_rot_error:
-                best_rot_error = val_metrics['rot_error_mean']
+            if val_metrics['rot_error_median'] < best_rot_error:
+                best_rot_error = val_metrics['rot_error_median']
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),

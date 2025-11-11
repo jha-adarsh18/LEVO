@@ -7,13 +7,87 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 import pickle
+import hashlib
+import json
+from multiprocessing import Pool, cpu_count
 
 def worker_init_fn(worker_id):
     pass
 
+def _load_and_process_events_worker(args):
+    seq_name, timestamp, sequences, event_window_ms, n_events = args
+    seq = sequences[seq_name]
+    
+    window_us = event_window_ms * 1000
+    t_start = timestamp - window_us / 2e6
+    t_end = timestamp + window_us / 2e6
+    
+    with h5py.File(seq['event_file'], 'r') as f:
+        has_ms_to_idx = 'ms_to_idx' in f
+        
+        if has_ms_to_idx:
+            ms_to_idx = f['ms_to_idx']
+            t_start_ms = max(0, int(t_start * 1000))
+            t_end_ms = int(t_end * 1000)
+            
+            start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else 0
+            end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(f['events']['t'])
+        else:
+            events_t = np.array(f['events']['t'][:])
+            if 't_offset' in f:
+                t_offset = f['t_offset'][()][0] / 1e6
+                events_t = events_t / 1e6 + t_offset
+            else:
+                events_t = events_t / 1e6
+            
+            start_idx = np.searchsorted(events_t, t_start)
+            end_idx = np.searchsorted(events_t, t_end)
+        
+        events_x = np.array(f['events']['x'][start_idx:end_idx])
+        events_y = np.array(f['events']['y'][start_idx:end_idx])
+        events_t = np.array(f['events']['t'][start_idx:end_idx])
+        events_p = np.array(f['events']['p'][start_idx:end_idx])
+        
+        if 't_offset' in f:
+            t_offset = f['t_offset'][()][0] / 1e6
+            events_t = events_t / 1e6 + t_offset
+        else:
+            events_t = events_t / 1e6
+    
+    width, height = seq['resolution']
+    events_x = events_x / float(width)
+    events_y = events_y / float(height)
+    
+    events = np.stack([events_x, events_y, events_t, events_p], axis=1).astype(np.float32)
+    
+    n = len(events)
+    
+    if n == 0:
+        return (seq_name, float(timestamp)), (np.zeros((n_events, 4), dtype=np.float32), np.zeros(n_events, dtype=np.float32))
+    
+    t_min, t_max = events[:, 2].min(), events[:, 2].max()
+    if t_max > t_min:
+        events[:, 2] = (events[:, 2] - t_min) / (t_max - t_min)
+    else:
+        events[:, 2] = 0.5
+    
+    if n > n_events:
+        indices = np.random.choice(n, n_events, replace=False)
+        indices = np.sort(indices)
+        sampled = events[indices]
+        mask = np.ones(n_events, dtype=np.float32)
+    else:
+        sampled = np.zeros((n_events, 4), dtype=np.float32)
+        sampled[:n] = events
+        mask = np.zeros(n_events, dtype=np.float32)
+        mask[:n] = 1.0
+    
+    return (seq_name, float(timestamp)), (sampled, mask)
+
 class EventVODataset(Dataset):
     def __init__(self, data_root, camera='left', dt_range=(50, 200), 
-             event_window_ms=50, n_events=2048, augment=False, intrinsics_config='config.yaml'):
+             event_window_ms=50, n_events=2048, augment=False, intrinsics_config='config.yaml',
+             num_workers=None):
         self.data_root = Path(data_root)
         self.camera = camera
         self.dt_range = dt_range
@@ -21,35 +95,69 @@ class EventVODataset(Dataset):
         self.n_events = n_events
         self.augment = augment
         
+        if num_workers is None:
+            num_workers = min(64, cpu_count())
+        self.num_workers = num_workers
+        
         with open(intrinsics_config, 'r') as f:
             self.intrinsics_config = yaml.safe_load(f)['intrinsics']
         
         self.pairs = self._build_pairs()
         print(f"Loaded {len(self.pairs)} frame pairs from {len(self.sequences)} sequences")
         
-        print("Pre-loading and preprocessing all event windows into RAM...")
-        self.preprocessed_events = {}
-        for idx in tqdm(range(len(self.pairs)), desc="Loading events"):
-            seq_name, i, j = self.pairs[idx]
-            seq = self.sequences[seq_name]
-            
-            t1 = seq['timestamps'][i]
-            t2 = seq['timestamps'][j]
-            
-            key1 = (seq_name, t1)
-            key2 = (seq_name, t2)
-            
-            if key1 not in self.preprocessed_events:
-                events1 = self._load_events(seq_name, t1)
-                events1, mask1 = self._process_events(events1, seq['resolution'])
-                self.preprocessed_events[key1] = (events1, mask1)
-            
-            if key2 not in self.preprocessed_events:
-                events2 = self._load_events(seq_name, t2)
-                events2, mask2 = self._process_events(events2, seq['resolution'])
-                self.preprocessed_events[key2] = (events2, mask2)
+        cache_key = self._get_cache_key()
+        cache_file = self.data_root / f".cache_{cache_key}.pkl"
         
-        print(f"✓ Preloaded {len(self.preprocessed_events)} unique event windows")
+        if cache_file.exists():
+            print(f"Loading preprocessed events from cache: {cache_file}")
+            with open(cache_file, 'rb') as f:
+                self.preprocessed_events = pickle.load(f)
+            print(f"✓ Loaded {len(self.preprocessed_events)} unique event windows from cache")
+        else:
+            print("Pre-loading and preprocessing all event windows into RAM...")
+            unique_keys = set()
+            for idx in range(len(self.pairs)):
+                seq_name, i, j = self.pairs[idx]
+                seq = self.sequences[seq_name]
+                unique_keys.add(self._normalize_key(seq_name, seq['timestamps'][i]))
+                unique_keys.add(self._normalize_key(seq_name, seq['timestamps'][j]))
+            
+            unique_keys = list(unique_keys)
+            print(f"Found {len(unique_keys)} unique event windows to load")
+            
+            worker_args = [
+                (seq_name, timestamp, self.sequences, self.event_window_ms, self.n_events)
+                for seq_name, timestamp in unique_keys
+            ]
+            
+            self.preprocessed_events = {}
+            with Pool(processes=self.num_workers) as pool:
+                for key, value in tqdm(
+                    pool.imap_unordered(_load_and_process_events_worker, worker_args),
+                    total=len(worker_args),
+                    desc="Loading events"
+                ):
+                    self.preprocessed_events[key] = value
+            
+            print(f"✓ Preloaded {len(self.preprocessed_events)} unique event windows")
+            print(f"Saving cache to {cache_file}")
+            with open(cache_file, 'wb') as f:
+                pickle.dump(self.preprocessed_events, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print("✓ Cache saved")
+    
+    def _normalize_key(self, seq_name, timestamp):
+        return (seq_name, float(timestamp))
+    
+    def _get_cache_key(self):
+        config_dict = {
+            'camera': self.camera,
+            'dt_range': self.dt_range,
+            'event_window_ms': self.event_window_ms,
+            'n_events': self.n_events,
+            'data_root': str(self.data_root),
+        }
+        config_str = json.dumps(config_dict, sort_keys=True)
+        return hashlib.md5(config_str.encode()).hexdigest()[:16]
     
     def _get_intrinsics(self, seq_name):
         seq_lower = seq_name.lower().replace('_', '-')
@@ -157,76 +265,6 @@ class EventVODataset(Dataset):
         
         return all_pairs
     
-    def _load_events(self, seq_name, timestamp):
-        seq = self.sequences[seq_name]
-        window_us = self.event_window_ms * 1000
-        t_start = timestamp - window_us / 2e6
-        t_end = timestamp + window_us / 2e6
-        
-        with h5py.File(seq['event_file'], 'r') as f:
-            events_t = np.array(f['events']['t'][:])
-            
-            if 't_offset' in f:
-                t_offset = f['t_offset'][()][0] / 1e6
-                events_t = events_t / 1e6 + t_offset
-            else:
-                events_t = events_t / 1e6
-            
-            has_ms_to_idx = 'ms_to_idx' in f
-            ms_to_idx = np.array(f['ms_to_idx'][:]) if has_ms_to_idx else None
-            
-            if has_ms_to_idx and ms_to_idx is not None:
-                t_start_ms = int(t_start * 1000)
-                t_end_ms = int(t_end * 1000)
-                start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else len(events_t)
-                end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(events_t)
-            else:
-                start_idx = np.searchsorted(events_t, t_start)
-                end_idx = np.searchsorted(events_t, t_end)
-            
-            events_x = np.array(f['events']['x'][start_idx:end_idx])
-            events_y = np.array(f['events']['y'][start_idx:end_idx])
-            events_t = np.array(f['events']['t'][start_idx:end_idx])
-            events_p = np.array(f['events']['p'][start_idx:end_idx])
-            
-            if 't_offset' in f:
-                t_offset = f['t_offset'][()][0] / 1e6
-                events_t = events_t / 1e6 + t_offset
-            else:
-                events_t = events_t / 1e6
-        
-        width, height = seq['resolution']
-        events_x = events_x / float(width)
-        events_y = events_y / float(height)
-        
-        events = np.stack([events_x, events_y, events_t, events_p], axis=1).astype(np.float32)
-        return events
-    
-    def _process_events(self, events, resolution):
-        n = len(events)
-        
-        if n == 0:
-            return np.zeros((self.n_events, 4), dtype=np.float32), np.zeros(self.n_events, dtype=np.float32)
-        
-        t_min, t_max = events[:, 2].min(), events[:, 2].max()
-        if t_max > t_min:
-            events[:, 2] = (events[:, 2] - t_min) / (t_max - t_min)
-        else:
-            events[:, 2] = 0.5
-        
-        if n > self.n_events:
-            indices = np.random.choice(n, self.n_events, replace=False)
-            indices = np.sort(indices)
-            sampled = events[indices]
-            mask = np.ones(self.n_events, dtype=np.float32)
-        else:
-            sampled = np.zeros((self.n_events, 4), dtype=np.float32)
-            sampled[:n] = events
-            mask = np.zeros(self.n_events, dtype=np.float32)
-            mask[:n] = 1.0
-        
-        return sampled, mask
-    
     def _compute_relative_pose(self, pose1, pose2):
         p1, q1 = pose1[:3], pose1[3:7]
         p2, q2 = pose2[:3], pose2[3:7]
@@ -259,8 +297,8 @@ class EventVODataset(Dataset):
         t1 = seq['timestamps'][i]
         t2 = seq['timestamps'][j]
         
-        events1, mask1 = self.preprocessed_events[(seq_name, t1)]
-        events2, mask2 = self.preprocessed_events[(seq_name, t2)]
+        events1, mask1 = self.preprocessed_events[self._normalize_key(seq_name, t1)]
+        events2, mask2 = self.preprocessed_events[self._normalize_key(seq_name, t2)]
         
         events1 = events1.copy()
         events2 = events2.copy()

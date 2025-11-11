@@ -69,3 +69,10 @@ intrinsics:
       - bike_easy
       - bike_hard
       - bike_night
+
+  corner_slow1:
+    fx: 327.32749
+    fy: 327.46184
+    cx: 304.97749
+    cy: 235.37621
+    resolution: [640, 480]

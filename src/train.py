@@ -59,7 +59,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, scheduler, device
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
@@ -71,8 +71,8 @@ def train_epoch(model, dataloader, optimizer, loss_fn, scaler, scheduler, device
         
         pbar.set_postfix({
             'loss': f"{stats['loss']:.3f}",
-            'rot': f"{stats['rot_loss']:.3f}",
-            'trans': f"{stats['trans_loss']:.3f}",
+            'match': f"{stats['match_loss']:.3f}",
+            'epi': f"{stats['epi_loss']:.3f}",
             'lr': f"{optimizer.param_groups[0]['lr']:.2e}",
             'skipped': f"{skipped_batches}/{total_batches}"
         })
@@ -87,168 +87,82 @@ def validate(model, dataloader, device):
     model.eval()
     rot_errors = []
     trans_errors = []
+    match_scores = []
     
-    debug_file = Path('validation_debug.txt')
-    with open(debug_file, 'w') as f:
-        f.write("=== Validation Debug Log ===\n\n")
+    for batch in tqdm(dataloader, desc="Validation"):
+        events1 = batch['events1'].to(device, non_blocking=True)
+        mask1 = batch['mask1'].to(device, non_blocking=True)
+        events2 = batch['events2'].to(device, non_blocking=True)
+        mask2 = batch['mask2'].to(device, non_blocking=True)
+        R_gt = batch['R_gt'].to(device, non_blocking=True)
+        t_gt = batch['t_gt'].to(device, non_blocking=True)
+        K = batch['K'].to(device, non_blocking=True)
         
-        batch_count = 0
-        for batch in tqdm(dataloader, desc="Validation"):
-            events1 = batch['events1'].to(device, non_blocking=True)
-            mask1 = batch['mask1'].to(device, non_blocking=True)
-            events2 = batch['events2'].to(device, non_blocking=True)
-            mask2 = batch['mask2'].to(device, non_blocking=True)
-            R_gt = batch['R_gt'].to(device, non_blocking=True)
-            t_gt = batch['t_gt'].to(device, non_blocking=True)
-            K = batch['K'].to(device, non_blocking=True)
+        if mask1.sum() == 0 or mask2.sum() == 0:
+            continue
+        
+        predictions = model(events1, mask1, events2, mask2, K)
+        R_pred = predictions['R_pred']
+        t_pred = predictions['t_pred']
+        matches = predictions['matches']
+        
+        match_scores.extend(matches.max(dim=2)[0].mean(dim=1).cpu().numpy().tolist())
+        
+        t_pred_norm = F.normalize(t_pred, p=2, dim=1)
+        t_gt_norm = F.normalize(t_gt, p=2, dim=1)
+        
+        for i in range(R_pred.shape[0]):
+            R_pred_i = R_pred[i]
+            R_gt_i = R_gt[i]
             
-            f.write(f"\n{'='*60}\n")
-            f.write(f"Batch {batch_count}\n")
-            f.write(f"mask1 sum: {mask1.sum().item()}, mask2 sum: {mask2.sum().item()}\n")
-            
-            if mask1.sum() == 0 or mask2.sum() == 0:
-                f.write("SKIPPED: Empty masks\n")
-                batch_count += 1
+            if torch.isnan(R_pred_i).any() or torch.isnan(R_gt_i).any():
                 continue
             
-            predictions = model(events1, mask1, events2, mask2, K)
-            R_pred = predictions['R_pred']
-            t_pred = predictions['t_pred']
+            if torch.isinf(R_pred_i).any() or torch.isinf(R_gt_i).any():
+                continue
             
-            f.write(f"\nR_pred shape: {R_pred.shape}\n")
-            f.write(f"R_pred stats: min={R_pred.min().item():.6f}, max={R_pred.max().item():.6f}, mean={R_pred.mean().item():.6f}\n")
-            f.write(f"R_pred has NaN: {torch.isnan(R_pred).any().item()}\n")
-            f.write(f"R_pred has Inf: {torch.isinf(R_pred).any().item()}\n")
+            trace = torch.trace(R_pred_i @ R_gt_i.T)
             
-            f.write(f"\nt_pred shape: {t_pred.shape}\n")
-            f.write(f"t_pred stats: min={t_pred.min().item():.6f}, max={t_pred.max().item():.6f}, mean={t_pred.mean().item():.6f}\n")
-            f.write(f"t_pred has NaN: {torch.isnan(t_pred).any().item()}\n")
-            f.write(f"t_pred has Inf: {torch.isinf(t_pred).any().item()}\n")
+            if torch.isnan(trace):
+                continue
             
-            f.write(f"\nR_gt stats: min={R_gt.min().item():.6f}, max={R_gt.max().item():.6f}\n")
-            f.write(f"R_gt has NaN: {torch.isnan(R_gt).any().item()}\n")
+            if trace < -1.1 or trace > 3.1:
+                continue
             
-            f.write(f"\nt_gt stats: min={t_gt.min().item():.6f}, max={t_gt.max().item():.6f}\n")
-            f.write(f"t_gt has NaN: {torch.isnan(t_gt).any().item()}\n")
+            trace_val = (trace - 1) / 2
+            trace_clamped = torch.clamp(trace_val, -0.9999, 0.9999)
+            rot_error = torch.acos(trace_clamped)
             
-            t_gt_norm = F.normalize(t_gt, p=2, dim=1)
+            if torch.isnan(rot_error):
+                continue
             
-            f.write(f"\n--- Per-sample analysis ---\n")
-            for i in range(R_pred.shape[0]):
-                f.write(f"\nSample {i}:\n")
-                
-                R_pred_i = R_pred[i]
-                R_gt_i = R_gt[i]
-                
-                f.write(f"  R_pred[{i}] has NaN: {torch.isnan(R_pred_i).any().item()}\n")
-                f.write(f"  R_pred[{i}] has Inf: {torch.isinf(R_pred_i).any().item()}\n")
-                
-                det_pred = torch.det(R_pred_i)
-                f.write(f"  det(R_pred[{i}]): {det_pred.item():.6f}\n")
-                
-                ortho_check = torch.norm(R_pred_i @ R_pred_i.T - torch.eye(3, device=device))
-                f.write(f"  orthogonality error: {ortho_check.item():.6f}\n")
-                
-                if torch.isnan(R_pred_i).any() or torch.isnan(R_gt_i).any():
-                    f.write(f"  SKIP: NaN in rotation matrices\n")
-                    continue
-                
-                if torch.isinf(R_pred_i).any() or torch.isinf(R_gt_i).any():
-                    f.write(f"  SKIP: Inf in rotation matrices\n")
-                    continue
-                
-                trace = torch.trace(R_pred_i @ R_gt_i.T)
-                f.write(f"  trace(R_pred @ R_gt.T): {trace.item():.6f}\n")
-                
-                if torch.isnan(trace):
-                    f.write(f"  SKIP: trace is NaN\n")
-                    continue
-                
-                if trace < -1.1 or trace > 3.1:
-                    f.write(f"  SKIP: trace out of valid range [-1, 3]\n")
-                    continue
-                
-                trace_val = (trace - 1) / 2
-                f.write(f"  (trace - 1) / 2: {trace_val.item():.6f}\n")
-                
-                trace_clamped = torch.clamp(trace_val, -0.9999, 0.9999)
-                f.write(f"  clamped value: {trace_clamped.item():.6f}\n")
-                
-                rot_error = torch.acos(trace_clamped)
-                f.write(f"  rot_error (rad): {rot_error.item():.6f}\n")
-                f.write(f"  rot_error (deg): {rot_error.item() * 180 / np.pi:.6f}\n")
-                
-                if torch.isnan(rot_error):
-                    f.write(f"  SKIP: rot_error is NaN\n")
-                    continue
-                
-                rot_errors.append(rot_error.item() * 180 / np.pi)
-                f.write(f"  ✓ Added to rot_errors\n")
-                
-                cos_sim = (t_pred[i] * t_gt_norm[i]).sum()
-                f.write(f"  cos_sim(t_pred, t_gt): {cos_sim.item():.6f}\n")
-                
-                if torch.isnan(cos_sim):
-                    f.write(f"  SKIP: cos_sim is NaN\n")
-                    continue
-                
-                cos_clamped = torch.clamp(cos_sim, -0.9999, 0.9999)
-                trans_error = torch.acos(cos_clamped)
-                f.write(f"  trans_error (rad): {trans_error.item():.6f}\n")
-                f.write(f"  trans_error (deg): {trans_error.item() * 180 / np.pi:.6f}\n")
-                
-                if torch.isnan(trans_error):
-                    f.write(f"  SKIP: trans_error is NaN\n")
-                    continue
-                
-                trans_errors.append(trans_error.item() * 180 / np.pi)
-                f.write(f"  ✓ Added to trans_errors\n")
+            rot_errors.append(rot_error.item() * 180 / np.pi)
             
-            batch_count += 1
-        
-        f.write(f"\n\n{'='*60}\n")
-        f.write(f"SUMMARY\n")
-        f.write(f"{'='*60}\n")
-        f.write(f"Total batches processed: {batch_count}\n")
-        f.write(f"Collected {len(rot_errors)} rotation errors\n")
-        f.write(f"Collected {len(trans_errors)} translation errors\n")
-        
-        if len(rot_errors) > 0:
-            f.write(f"\nRotation errors:\n")
-            f.write(f"  mean: {np.mean(rot_errors):.6f}°\n")
-            f.write(f"  median: {np.median(rot_errors):.6f}°\n")
-            f.write(f"  min: {np.min(rot_errors):.6f}°\n")
-            f.write(f"  max: {np.max(rot_errors):.6f}°\n")
-            f.write(f"  std: {np.std(rot_errors):.6f}°\n")
-            f.write(f"  NaN count: {sum(np.isnan(rot_errors))}\n")
-        else:
-            f.write(f"\nNo valid rotation errors collected!\n")
-        
-        if len(trans_errors) > 0:
-            f.write(f"\nTranslation errors:\n")
-            f.write(f"  mean: {np.mean(trans_errors):.6f}°\n")
-            f.write(f"  median: {np.median(trans_errors):.6f}°\n")
-            f.write(f"  min: {np.min(trans_errors):.6f}°\n")
-            f.write(f"  max: {np.max(trans_errors):.6f}°\n")
-            f.write(f"  std: {np.std(trans_errors):.6f}°\n")
-            f.write(f"  NaN count: {sum(np.isnan(trans_errors))}\n")
-        else:
-            f.write(f"\nNo valid translation errors collected!\n")
-    
-    print(f"Collected {len(rot_errors)} rotation errors, {len(trans_errors)} translation errors")
-    print(f"Debug info written to {debug_file}")
+            cos_sim = (t_pred_norm[i] * t_gt_norm[i]).sum()
+            
+            if torch.isnan(cos_sim):
+                continue
+            
+            cos_clamped = torch.clamp(cos_sim, -0.9999, 0.9999)
+            trans_error = torch.acos(cos_clamped)
+            
+            if torch.isnan(trans_error):
+                continue
+            
+            trans_errors.append(trans_error.item() * 180 / np.pi)
     
     return {
         'rot_error_mean': np.mean(rot_errors) if len(rot_errors) > 0 else float('nan'),
         'rot_error_median': np.median(rot_errors) if len(rot_errors) > 0 else float('nan'),
         'trans_error_mean': np.mean(trans_errors) if len(trans_errors) > 0 else float('nan'),
-        'trans_error_median': np.median(trans_errors) if len(trans_errors) > 0 else float('nan')
+        'trans_error_median': np.median(trans_errors) if len(trans_errors) > 0 else float('nan'),
+        'match_score_mean': np.mean(match_scores) if len(match_scores) > 0 else 0.0
     }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data-root', type=str, required=True)
+    parser.add_argument('--data-root', type=str, default='/workspace/dataset')
     parser.add_argument('--output-dir', type=str, default='./checkpoints_vo')
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--epochs', type=int, default=50)
@@ -258,16 +172,18 @@ def main():
     parser.add_argument('--dt-range', type=int, nargs=2, default=[50, 200])
     parser.add_argument('--n-events', type=int, default=2048)
     parser.add_argument('--d-model', type=int, default=256)
-    parser.add_argument('--validate-every', type=int, default=5)
+    parser.add_argument('--validate-every', type=int, default=2)
     parser.add_argument('--save-every', type=int, default=10)
     parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--intrinsics-config', type=str, default='/home/adarsh/PEVSLAM/configs/config.yaml')
+    parser.add_argument('--intrinsics-config', type=str, default='/workspace/PEVSLAM/configs/config.yaml')
     parser.add_argument('--wandb-project', type=str, default='event-vo')
     parser.add_argument('--wandb-name', type=str, default=None)
     parser.add_argument('--num-samples', type=int, default=500)
     parser.add_argument('--prefetch-factor', type=int, default=4)
     parser.add_argument('--stratified-sampling', action='store_true')
     parser.add_argument('--warmup-steps', type=int, default=2000)
+    parser.add_argument('--training-stage', type=str, default='matching', choices=['matching', 'joint'])
+    parser.add_argument('--stage1-epochs', type=int, default=20)
     
     args = parser.parse_args()
     
@@ -370,7 +286,31 @@ def main():
     model = EventVO(d_model=args.d_model, num_samples=args.num_samples).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     
-    loss_fn = VOLoss()
+    if args.training_stage == 'matching':
+        print("\n" + "="*60)
+        print("STAGE 1: MATCHING-ONLY TRAINING")
+        print("Pose losses disabled - focusing on correspondence quality")
+        print("="*60 + "\n")
+        loss_fn = VOLoss(
+            w_rot=0.0,
+            w_trans=0.0,
+            w_match=10.0,
+            w_epipolar=5.0,
+            w_contrastive=2.0
+        )
+    else:
+        print("\n" + "="*60)
+        print("STAGE 2: JOINT TRAINING")
+        print("All losses enabled with matching-dominant weighting")
+        print("="*60 + "\n")
+        loss_fn = VOLoss(
+            w_rot=0.5,
+            w_trans=1.0,
+            w_match=10.0,
+            w_epipolar=5.0,
+            w_contrastive=2.0
+        )
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     
     def lr_lambda(step):
@@ -384,7 +324,7 @@ def main():
     scaler = GradScaler('cuda')
     
     start_epoch = 0
-    best_rot_error = float('inf')
+    best_metric = float('inf')
     
     if args.resume:
         checkpoint = torch.load(args.resume, weights_only=False)
@@ -393,18 +333,10 @@ def main():
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
-        best_rot_error = checkpoint.get('best_rot_error', float('inf'))
+        best_metric = checkpoint.get('best_metric', float('inf'))
         print(f"Resumed from epoch {start_epoch}")
     
     for epoch in range(start_epoch, args.epochs):
-        if epoch < 20:
-            loss_fn.w_pose = 1.0
-            loss_fn.w_match = 0.0
-            loss_fn.w_epipolar = 0.0
-            loss_fn.w_contrastive = 0.0
-        else:
-            loss_fn.update_weights(epoch, args.epochs)
-        
         train_metrics = train_epoch(model, train_loader, optimizer, loss_fn, scaler, scheduler, device, epoch)
         
         wandb.log({
@@ -415,11 +347,16 @@ def main():
             'train/match_loss': train_metrics['match_loss'],
             'train/epi_loss': train_metrics['epi_loss'],
             'train/contrastive_loss': train_metrics['contrastive_loss'],
-            'lr': optimizer.param_groups[0]['lr']
+            'lr': optimizer.param_groups[0]['lr'],
+            'w_rot': loss_fn.w_rot,
+            'w_trans': loss_fn.w_trans,
+            'w_match': loss_fn.w_match,
+            'w_epipolar': loss_fn.w_epipolar,
+            'w_contrastive': loss_fn.w_contrastive
         })
         
         print(f"\nEpoch {epoch}: Loss={train_metrics['loss']:.3f}, "
-              f"Rot={train_metrics['rot_loss']:.3f}, Trans={train_metrics['trans_loss']:.3f}")
+              f"Match={train_metrics['match_loss']:.3f}, Epi={train_metrics['epi_loss']:.3f}")
         
         if (epoch + 1) % args.validate_every == 0:
             val_metrics = validate(model, val_loader, device)
@@ -429,14 +366,22 @@ def main():
                 'val/rot_error_mean': val_metrics['rot_error_mean'],
                 'val/rot_error_median': val_metrics['rot_error_median'],
                 'val/trans_error_mean': val_metrics['trans_error_mean'],
-                'val/trans_error_median': val_metrics['trans_error_median']
+                'val/trans_error_median': val_metrics['trans_error_median'],
+                'val/match_score_mean': val_metrics['match_score_mean']
             })
             
-            print(f"Val - Rot: {val_metrics['rot_error_mean']:.2f}° (median: {val_metrics['rot_error_median']:.2f}°)")
-            print(f"Val - Trans: {val_metrics['trans_error_mean']:.2f}° (median: {val_metrics['trans_error_median']:.2f}°)")
+            print(f"Val - Match Score: {val_metrics['match_score_mean']:.4f}")
+            if not np.isnan(val_metrics['rot_error_mean']):
+                print(f"Val - Rot: {val_metrics['rot_error_mean']:.2f}° (median: {val_metrics['rot_error_median']:.2f}°)")
+                print(f"Val - Trans: {val_metrics['trans_error_mean']:.2f}° (median: {val_metrics['trans_error_median']:.2f}°)")
             
-            if val_metrics['rot_error_mean'] < best_rot_error:
-                best_rot_error = val_metrics['rot_error_mean']
+            if args.training_stage == 'matching':
+                current_metric = -val_metrics['match_score_mean']
+            else:
+                current_metric = val_metrics['rot_error_median']
+            
+            if current_metric < best_metric:
+                best_metric = current_metric
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
@@ -444,9 +389,12 @@ def main():
                     'scheduler_state_dict': scheduler.state_dict(),
                     'scaler_state_dict': scaler.state_dict(),
                     'metrics': val_metrics,
-                    'best_rot_error': best_rot_error,
+                    'best_metric': best_metric,
                 }, output_dir / 'best_model.pth')
-                print(f"✓ Best model saved: Rot={best_rot_error:.2f}°")
+                if args.training_stage == 'matching':
+                    print(f"✓ Best model saved: Match Score={val_metrics['match_score_mean']:.4f}")
+                else:
+                    print(f"✓ Best model saved: Rot={val_metrics['rot_error_median']:.2f}°")
         
         if (epoch + 1) % args.save_every == 0:
             torch.save({
@@ -455,10 +403,10 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict(),
-                'best_rot_error': best_rot_error,
+                'best_metric': best_metric,
             }, output_dir / f'checkpoint_{epoch:03d}.pth')
     
-    print(f"\n✓ Training complete! Best rot error: {best_rot_error:.2f}°")
+    print(f"\n✓ Training complete!")
     wandb.finish()
 
 
