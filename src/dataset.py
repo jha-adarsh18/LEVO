@@ -1,0 +1,360 @@
+import h5py
+import hdf5plugin
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from pathlib import Path
+import yaml
+from tqdm import tqdm
+import pickle
+import hashlib
+import json
+from multiprocessing import Pool, cpu_count
+
+def worker_init_fn(worker_id):
+    pass
+
+def _load_and_process_events_worker(args):
+    seq_name, timestamp, sequences, event_window_ms, n_events = args
+    seq = sequences[seq_name]
+    
+    window_us = event_window_ms * 1000
+    t_start = timestamp - window_us / 2e6
+    t_end = timestamp + window_us / 2e6
+    
+    with h5py.File(seq['event_file'], 'r') as f:
+        has_ms_to_idx = 'ms_to_idx' in f
+        
+        if has_ms_to_idx:
+            ms_to_idx = f['ms_to_idx']
+            t_start_ms = max(0, int(t_start * 1000))
+            t_end_ms = int(t_end * 1000)
+            
+            start_idx = ms_to_idx[t_start_ms] if t_start_ms < len(ms_to_idx) else 0
+            end_idx = ms_to_idx[t_end_ms] if t_end_ms < len(ms_to_idx) else len(f['events']['t'])
+        else:
+            events_t = np.array(f['events']['t'][:])
+            if 't_offset' in f:
+                t_offset = f['t_offset'][()][0] / 1e6
+                events_t = events_t / 1e6 + t_offset
+            else:
+                events_t = events_t / 1e6
+            
+            start_idx = np.searchsorted(events_t, t_start)
+            end_idx = np.searchsorted(events_t, t_end)
+        
+        events_x = np.array(f['events']['x'][start_idx:end_idx])
+        events_y = np.array(f['events']['y'][start_idx:end_idx])
+        events_t = np.array(f['events']['t'][start_idx:end_idx])
+        events_p = np.array(f['events']['p'][start_idx:end_idx])
+        
+        if 't_offset' in f:
+            t_offset = f['t_offset'][()][0] / 1e6
+            events_t = events_t / 1e6 + t_offset
+        else:
+            events_t = events_t / 1e6
+    
+    width, height = seq['resolution']
+    events_x = events_x / float(width)
+    events_y = events_y / float(height)
+    
+    events = np.stack([events_x, events_y, events_t, events_p], axis=1).astype(np.float32)
+    
+    n = len(events)
+    
+    if n == 0:
+        return (seq_name, float(timestamp)), (np.zeros((n_events, 4), dtype=np.float32), np.zeros(n_events, dtype=np.float32))
+    
+    t_min, t_max = events[:, 2].min(), events[:, 2].max()
+    if t_max > t_min:
+        events[:, 2] = (events[:, 2] - t_min) / (t_max - t_min)
+    else:
+        events[:, 2] = 0.5
+    
+    if n > n_events:
+        indices = np.random.choice(n, n_events, replace=False)
+        indices = np.sort(indices)
+        sampled = events[indices]
+        mask = np.ones(n_events, dtype=np.float32)
+    else:
+        sampled = np.zeros((n_events, 4), dtype=np.float32)
+        sampled[:n] = events
+        mask = np.zeros(n_events, dtype=np.float32)
+        mask[:n] = 1.0
+    
+    return (seq_name, float(timestamp)), (sampled, mask)
+
+class EventVODataset(Dataset):
+    def __init__(self, data_root, camera='left', dt_range=(50, 200), 
+             event_window_ms=50, n_events=2048, augment=False, intrinsics_config='config.yaml',
+             num_workers=None):
+        self.data_root = Path(data_root)
+        self.camera = camera
+        self.dt_range = dt_range
+        self.event_window_ms = event_window_ms
+        self.n_events = n_events
+        self.augment = augment
+        
+        if num_workers is None:
+            num_workers = min(64, cpu_count())
+        self.num_workers = num_workers
+        
+        with open(intrinsics_config, 'r') as f:
+            self.intrinsics_config = yaml.safe_load(f)['intrinsics']
+        
+        self.pairs = self._build_pairs()
+        print(f"Loaded {len(self.pairs)} frame pairs from {len(self.sequences)} sequences")
+        
+        cache_key = self._get_cache_key()
+        cache_file = self.data_root / f".cache_{cache_key}.pkl"
+        
+        if cache_file.exists():
+            print(f"Loading preprocessed events from cache: {cache_file}")
+            with open(cache_file, 'rb') as f:
+                self.preprocessed_events = pickle.load(f)
+            print(f"✓ Loaded {len(self.preprocessed_events)} unique event windows from cache")
+        else:
+            print("Pre-loading and preprocessing all event windows into RAM...")
+            unique_keys = set()
+            for idx in range(len(self.pairs)):
+                seq_name, i, j = self.pairs[idx]
+                seq = self.sequences[seq_name]
+                unique_keys.add(self._normalize_key(seq_name, seq['timestamps'][i]))
+                unique_keys.add(self._normalize_key(seq_name, seq['timestamps'][j]))
+            
+            unique_keys = list(unique_keys)
+            print(f"Found {len(unique_keys)} unique event windows to load")
+            
+            worker_args = [
+                (seq_name, timestamp, self.sequences, self.event_window_ms, self.n_events)
+                for seq_name, timestamp in unique_keys
+            ]
+            
+            self.preprocessed_events = {}
+            with Pool(processes=self.num_workers) as pool:
+                for key, value in tqdm(
+                    pool.imap_unordered(_load_and_process_events_worker, worker_args),
+                    total=len(worker_args),
+                    desc="Loading events"
+                ):
+                    self.preprocessed_events[key] = value
+            
+            print(f"✓ Preloaded {len(self.preprocessed_events)} unique event windows")
+            print(f"Saving cache to {cache_file}")
+            with open(cache_file, 'wb') as f:
+                pickle.dump(self.preprocessed_events, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print("✓ Cache saved")
+    
+    def _normalize_key(self, seq_name, timestamp):
+        return (seq_name, float(timestamp))
+    
+    def _get_cache_key(self):
+        config_dict = {
+            'camera': self.camera,
+            'dt_range': self.dt_range,
+            'event_window_ms': self.event_window_ms,
+            'n_events': self.n_events,
+            'data_root': str(self.data_root),
+        }
+        config_str = json.dumps(config_dict, sort_keys=True)
+        return hashlib.md5(config_str.encode()).hexdigest()[:16]
+    
+    def _get_intrinsics(self, seq_name):
+        seq_lower = seq_name.lower().replace('_', '-')
+        
+        if 'indoor-flying' in seq_lower:
+            K_params = self.intrinsics_config['indoor_flying']
+        elif 'outdoor-night' in seq_lower:
+            K_params = self.intrinsics_config['outdoor_night']
+        elif 'outdoor-day' in seq_lower:
+            K_params = self.intrinsics_config['outdoor_day']
+        elif any(s.replace('_', '-') in seq_lower for s in self.intrinsics_config['group_D']['sequences']):
+            K_params = self.intrinsics_config['group_D']
+        elif any(s.replace('_', '-') in seq_lower for s in self.intrinsics_config['group_E']['sequences']):
+            K_params = self.intrinsics_config['group_E']
+        else:
+            print(f"Warning: Using default intrinsics for {seq_name}")
+            K_params = self.intrinsics_config.get('default', self.intrinsics_config['indoor_flying'])
+        
+        K = np.array([
+            [K_params['fx'], 0, K_params['cx']],
+            [0, K_params['fy'], K_params['cy']],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        
+        return K
+    
+    def _is_group_d_sequence(self, seq_name):
+        seq_lower = seq_name.lower().replace('_', '-')
+        return any(s.replace('_', '-') in seq_lower for s in self.intrinsics_config['group_D']['sequences'])
+    
+    def _build_pairs(self):
+        self.sequences = {}
+        all_pairs = []
+        
+        for seq_dir in sorted(self.data_root.iterdir()):
+            if not seq_dir.is_dir():
+                continue
+            
+            seq_name = seq_dir.name
+            
+            if self._is_group_d_sequence(seq_name):
+                print(f"Skipping Group D sequence: {seq_name}")
+                continue
+            
+            is_mvsec = 'indoor' in seq_name.lower() or 'outdoor' in seq_name.lower()
+            
+            event_files = list(seq_dir.glob(f"*{self.camera}*.h5"))
+            if not event_files:
+                print(f"No event file found for {seq_name}, skipping")
+                continue
+            event_file = event_files[0]
+            
+            pose_files = list(seq_dir.glob("*.txt"))
+            if not pose_files:
+                print(f"No pose file found for {seq_name}, skipping")
+                continue
+            pose_file = pose_files[0]
+            
+            poses = np.loadtxt(pose_file)
+            timestamps = poses[:, 0]
+            
+            timestamps = timestamps / 1e6
+            
+            K = self._get_intrinsics(seq_name)
+            
+            if is_mvsec:
+                resolution = (346, 260)
+            else:
+                seq_lower = seq_name.lower().replace('_', '-')
+                if any(s.replace('_', '-') in seq_lower for s in self.intrinsics_config['group_E']['sequences']):
+                    K_params = self.intrinsics_config['group_E']
+                    resolution = tuple(K_params['resolution'])
+                else:
+                    resolution = (1280, 720)
+            
+            self.sequences[seq_name] = {
+                'event_file': str(event_file),
+                'timestamps': timestamps,
+                'poses': poses[:, 1:],
+                'is_mvsec': is_mvsec,
+                'resolution': resolution,
+                'K': K,
+            }
+            
+            dt_min_sec = self.dt_range[0] / 1000.0
+            dt_max_sec = self.dt_range[1] / 1000.0
+            
+            seq_pairs = []
+            for i in range(len(timestamps) - 1):
+                for j in range(i + 1, len(timestamps)):
+                    dt = timestamps[j] - timestamps[i]
+                    if dt > dt_max_sec:
+                        break
+                    if dt >= dt_min_sec:
+                        seq_pairs.append((seq_name, i, j))
+            
+            if len(seq_pairs) > 1000:
+                seq_seed = 42 + hash(seq_name) % 1000
+                rng = np.random.RandomState(seq_seed)
+                sampled_indices = rng.choice(len(seq_pairs), 1000, replace=False)
+                seq_pairs = [seq_pairs[idx] for idx in sampled_indices]
+            
+            all_pairs.extend(seq_pairs)
+            print(f"{seq_name}: {len(seq_pairs)} pairs")
+        
+        return all_pairs
+    
+    def _compute_relative_pose(self, pose1, pose2):
+        p1, q1 = pose1[:3], pose1[3:7]
+        p2, q2 = pose2[:3], pose2[3:7]
+        
+        R1 = self._quat_to_rot(q1)
+        R2 = self._quat_to_rot(q2)
+        
+        R_rel = R2 @ R1.T
+        t_rel = R1.T @ (p2 - p1)
+        
+        return R_rel, t_rel
+    
+    def _quat_to_rot(self, q):
+        q = q / np.linalg.norm(q)
+        x, y, z, w = q
+        R = np.array([
+            [1-2*(y**2+z**2), 2*(x*y-w*z), 2*(x*z+w*y)],
+            [2*(x*y+w*z), 1-2*(x**2+z**2), 2*(y*z-w*x)],
+            [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x**2+y**2)]
+        ])
+        return R
+    
+    def __len__(self):
+        return len(self.pairs)
+    
+    def __getitem__(self, idx):
+        seq_name, i, j = self.pairs[idx]
+        seq = self.sequences[seq_name]
+        
+        t1 = seq['timestamps'][i]
+        t2 = seq['timestamps'][j]
+        
+        events1, mask1 = self.preprocessed_events[self._normalize_key(seq_name, t1)]
+        events2, mask2 = self.preprocessed_events[self._normalize_key(seq_name, t2)]
+        
+        events1 = events1.copy()
+        events2 = events2.copy()
+        mask1 = mask1.copy()
+        mask2 = mask2.copy()
+        
+        if self.augment:
+            n1 = int(mask1.sum())
+            n2 = int(mask2.sum())
+            
+            if n1 > 0:
+                events1[:n1, :2] += np.random.uniform(-0.03, 0.03, (n1, 2))
+                events1[:n1, :2] = np.clip(events1[:n1, :2], 0, 1)
+                events1[:n1, 2] += np.random.uniform(-0.1, 0.1, n1)
+                events1[:n1, 2] = np.clip(events1[:n1, 2], 0, 1)
+                if np.random.rand() < 0.1:
+                    events1[:n1, 3] = 1 - events1[:n1, 3]
+            
+            if n2 > 0:
+                events2[:n2, :2] += np.random.uniform(-0.03, 0.03, (n2, 2))
+                events2[:n2, :2] = np.clip(events2[:n2, :2], 0, 1)
+                events2[:n2, 2] += np.random.uniform(-0.1, 0.1, n2)
+                events2[:n2, 2] = np.clip(events2[:n2, 2], 0, 1)
+                if np.random.rand() < 0.1:
+                    events2[:n2, 3] = 1 - events2[:n2, 3]
+        
+        R_rel, t_rel = self._compute_relative_pose(seq['poses'][i], seq['poses'][j])
+        
+        return {
+            'events1': torch.from_numpy(events1),
+            'mask1': torch.from_numpy(mask1),
+            'events2': torch.from_numpy(events2),
+            'mask2': torch.from_numpy(mask2),
+            'R_gt': torch.from_numpy(R_rel).float(),
+            't_gt': torch.from_numpy(t_rel).float(),
+            'K': torch.from_numpy(seq['K']).float(),
+            'resolution': torch.tensor(seq['resolution'], dtype=torch.float32),
+        }
+
+def collate_fn(batch):
+    return {
+        'events1': torch.stack([item['events1'] for item in batch]),
+        'mask1': torch.stack([item['mask1'] for item in batch]),
+        'events2': torch.stack([item['events2'] for item in batch]),
+        'mask2': torch.stack([item['mask2'] for item in batch]),
+        'R_gt': torch.stack([item['R_gt'] for item in batch]),
+        't_gt': torch.stack([item['t_gt'] for item in batch]),
+        'K': torch.stack([item['K'] for item in batch]),
+        'resolution': torch.stack([item['resolution'] for item in batch]),
+    }
+
+def create_dataloader(data_root, batch_size=8, num_workers=4, **kwargs):
+    dataset = EventVODataset(data_root, **kwargs)
+    return torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, collate_fn=collate_fn,
+        pin_memory=True, persistent_workers=num_workers > 0,
+        worker_init_fn=worker_init_fn
+    )

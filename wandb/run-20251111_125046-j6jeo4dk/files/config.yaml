@@ -1,0 +1,137 @@
+_wandb:
+    value:
+        cli_version: 0.22.1
+        e:
+            w2vzzept9ohkjs3fexfpgica7fka3x6j:
+                args:
+                    - --data-root
+                    - /workspace/dataset
+                    - --output-dir
+                    - ./checkpoints_mvsec_tumvie_v2
+                    - --batch-size
+                    - "24"
+                    - --epochs
+                    - "50"
+                    - --lr
+                    - "3e-5"
+                    - --num-workers
+                    - "16"
+                    - --camera
+                    - left
+                    - --dt-range
+                    - "50"
+                    - "200"
+                    - --n-events
+                    - "2048"
+                    - --d-model
+                    - "256"
+                    - --num-samples
+                    - "500"
+                    - --validate-every
+                    - "2"
+                    - --save-every
+                    - "10"
+                    - --warmup-steps
+                    - "2000"
+                    - --prefetch-factor
+                    - "4"
+                    - --wandb-project
+                    - event-vo-cvpr
+                    - --wandb-name
+                    - mvsec_tumvie_v2
+                    - --intrinsics-config
+                    - /workspace/PEVSLAM/configs/config.yaml
+                    - --w-rot
+                    - "1.0"
+                    - --w-trans
+                    - "5.0"
+                    - --w-match-final
+                    - "0.3"
+                    - --w-epipolar-final
+                    - "0.15"
+                    - --w-contrastive-final
+                    - "0.1"
+                    - --ramp-epochs
+                    - "20"
+                codePath: src/train.py
+                codePathLocal: src/train.py
+                email: jhaadarsh350@gmail.com
+                executable: /home/adarsh/miniconda3/envs/pevslam/bin/python
+                git:
+                    commit: b8a13dd8806f6243f00bf648372d1251cba992bf
+                    remote: git@github.com:jha-adarsh18/PEVSLAM.git
+                host: adarsh-ZenBook
+                os: Linux-6.14.0-33-generic-x86_64-with-glibc2.39
+                program: /home/adarsh/PEVSLAM/src/train.py
+                python: CPython 3.12.11
+                root: /home/adarsh/PEVSLAM
+                startedAt: "2025-11-11T07:20:46.675802Z"
+                writerId: w2vzzept9ohkjs3fexfpgica7fka3x6j
+        m: []
+        python_version: 3.12.11
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 13
+                - 16
+            "4": 3.12.11
+            "5": 0.22.1
+            "12": 0.22.1
+            "13": linux-x86_64
+batch_size:
+    value: 24
+camera:
+    value: left
+d_model:
+    value: 256
+data_root:
+    value: /workspace/dataset
+dt_range:
+    value:
+        - 50
+        - 200
+epochs:
+    value: 50
+intrinsics_config:
+    value: /workspace/PEVSLAM/configs/config.yaml
+lr:
+    value: 3e-05
+n_events:
+    value: 2048
+num_samples:
+    value: 500
+num_workers:
+    value: 16
+output_dir:
+    value: ./checkpoints_mvsec_tumvie_v2
+prefetch_factor:
+    value: 4
+ramp_epochs:
+    value: 20
+resume:
+    value: null
+save_every:
+    value: 10
+stratified_sampling:
+    value: false
+validate_every:
+    value: 2
+w_contrastive_final:
+    value: 0.1
+w_epipolar_final:
+    value: 0.15
+w_match_final:
+    value: 0.3
+w_rot:
+    value: 1
+w_trans:
+    value: 5
+wandb_name:
+    value: mvsec_tumvie_v2
+wandb_project:
+    value: event-vo-cvpr
+warmup_steps:
+    value: 2000

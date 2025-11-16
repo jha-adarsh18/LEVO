@@ -1,0 +1,78 @@
+# config.yaml
+intrinsics:
+  indoor_flying:
+    fx: 226.38018519795807
+    fy: 226.15002947047415
+    cx: 173.6470807871759
+    cy: 133.73271487507847
+    resolution: [346, 260]
+  
+  outdoor_night:
+    fx: 225.7028124771077
+    fy: 225.3928747331328
+    cx: 167.3925764568589
+    cy: 126.81201949043754
+    resolution: [346, 260]
+  
+  outdoor_day:
+    fx: 223.9940010790056
+    fy: 223.61783486959376
+    cx: 170.7684322973841
+    cy: 128.18711828338436
+    resolution: [346, 260]
+
+  corridor_dolly:
+    fx: 327.32749
+    fy: 327.46184
+    cx: 304.97749
+    cy: 235.37621
+    resolution: [640, 480]
+  
+  group_D:
+    fx: 1049.5830934616608
+    fy: 1049.4229746040553
+    cx: 634.7184038833433
+    cy: 263.46974530961836
+    resolution: [1280, 720]
+    sequences:
+      - loop_floor0
+      - loop_floor1
+      - loop_floor2
+      - loop_floor3
+      - mocap_desk
+      - mocap_desk2
+      - skate_easy
+
+  group_E:
+    fx: 1051.3170714099033
+    fy: 1051.7952009807022
+    cx: 636.1348547903337
+    cy: 265.7059221322115
+    k1: -0.13104704164707634
+    k2: 0.07279844505754081
+    k3: -0.21109298825047648
+    k4: 0.18493426446978858
+    resolution: [1280, 720]
+    sequences:
+      - mocap_1d_trans
+      - mocap_3d_trans
+      - mocap_6dof
+      - mocap_shake
+      - mocap_shake2
+      - office_maze
+      - running_easy
+      - running_hard
+      - skate_easy
+      - skate_hard
+      - floor2_dark
+      - slide
+      - bike_easy
+      - bike_hard
+      - bike_night
+
+  corner_slow1:
+    fx: 327.32749
+    fy: 327.46184
+    cx: 304.97749
+    cy: 235.37621
+    resolution: [640, 480]

@@ -1,0 +1,8 @@
+min_translation: 0.1
+min_rotation: 5.0
+max_keyframes: 50
+ba_window_size: 10
+ba_iterations: 20
+min_observations: 2
+max_reprojection_error: 3.0
+pgo_every_n_frames: 50

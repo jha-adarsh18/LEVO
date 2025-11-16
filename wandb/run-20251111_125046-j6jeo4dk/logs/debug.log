@@ -1,0 +1,23 @@
+2025-11-11 12:50:46,678 INFO    MainThread:26956 [wandb_setup.py:_flush():81] Current SDK version is 0.22.1
+2025-11-11 12:50:46,678 INFO    MainThread:26956 [wandb_setup.py:_flush():81] Configure stats pid to 26956
+2025-11-11 12:50:46,678 INFO    MainThread:26956 [wandb_setup.py:_flush():81] Loading settings from /home/adarsh/.config/wandb/settings
+2025-11-11 12:50:46,678 INFO    MainThread:26956 [wandb_setup.py:_flush():81] Loading settings from /home/adarsh/PEVSLAM/wandb/settings
+2025-11-11 12:50:46,678 INFO    MainThread:26956 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2025-11-11 12:50:46,678 INFO    MainThread:26956 [wandb_init.py:setup_run_log_directory():705] Logging user logs to /home/adarsh/PEVSLAM/wandb/run-20251111_125046-j6jeo4dk/logs/debug.log
+2025-11-11 12:50:46,678 INFO    MainThread:26956 [wandb_init.py:setup_run_log_directory():706] Logging internal logs to /home/adarsh/PEVSLAM/wandb/run-20251111_125046-j6jeo4dk/logs/debug-internal.log
+2025-11-11 12:50:46,678 INFO    MainThread:26956 [wandb_init.py:init():832] calling init triggers
+2025-11-11 12:50:46,678 INFO    MainThread:26956 [wandb_init.py:init():837] wandb.init called with sweep_config: {}
+config: {'data_root': '/workspace/dataset', 'output_dir': './checkpoints_mvsec_tumvie_v2', 'batch_size': 24, 'epochs': 50, 'lr': 3e-05, 'num_workers': 16, 'camera': 'left', 'dt_range': [50, 200], 'n_events': 2048, 'd_model': 256, 'validate_every': 2, 'save_every': 10, 'resume': None, 'intrinsics_config': '/workspace/PEVSLAM/configs/config.yaml', 'wandb_project': 'event-vo-cvpr', 'wandb_name': 'mvsec_tumvie_v2', 'num_samples': 500, 'prefetch_factor': 4, 'stratified_sampling': False, 'warmup_steps': 2000, 'w_rot': 1.0, 'w_trans': 5.0, 'w_match_final': 0.3, 'w_epipolar_final': 0.15, 'w_contrastive_final': 0.1, 'ramp_epochs': 20, '_wandb': {}}
+2025-11-11 12:50:46,679 INFO    MainThread:26956 [wandb_init.py:init():880] starting backend
+2025-11-11 12:50:46,897 INFO    MainThread:26956 [wandb_init.py:init():883] sending inform_init request
+2025-11-11 12:50:46,908 INFO    MainThread:26956 [wandb_init.py:init():891] backend started and connected
+2025-11-11 12:50:46,909 INFO    MainThread:26956 [wandb_init.py:init():961] updated telemetry
+2025-11-11 12:50:46,916 INFO    MainThread:26956 [wandb_init.py:init():985] communicating run to backend with 90.0 second timeout
+2025-11-11 12:50:47,987 INFO    MainThread:26956 [wandb_init.py:init():1036] starting run threads in backend
+2025-11-11 12:50:48,186 INFO    MainThread:26956 [wandb_run.py:_console_start():2506] atexit reg
+2025-11-11 12:50:48,186 INFO    MainThread:26956 [wandb_run.py:_redirect():2354] redirect: wrap_raw
+2025-11-11 12:50:48,186 INFO    MainThread:26956 [wandb_run.py:_redirect():2423] Wrapping output streams.
+2025-11-11 12:50:48,186 INFO    MainThread:26956 [wandb_run.py:_redirect():2446] Redirects installed.
+2025-11-11 12:50:48,190 INFO    MainThread:26956 [wandb_init.py:init():1076] run started, returning control to user process
+2025-11-11 12:50:48,195 INFO    wandb-AsyncioManager-main:26956 [service_client.py:_forward_responses():80] Reached EOF.
+2025-11-11 12:50:48,195 INFO    wandb-AsyncioManager-main:26956 [mailbox.py:close():137] Closing mailbox, abandoning 2 handles.

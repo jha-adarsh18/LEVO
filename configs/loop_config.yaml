@@ -1,0 +1,6 @@
+descriptor_threshold: 0.85
+min_temporal_distance: 30
+min_spatial_distance: 5.0
+ransac_threshold: 3.0
+min_inliers: 20
+max_candidates: 5

@@ -209,6 +209,7 @@ class HierarchyStructure(nn.Module):
         dists = torch.sum((xyz_expanded - new_xyz_expanded) ** 2, dim=1) # [B, N, npoint]
 
         if mask is not None:
+            mask = mask.bool() if mask.dtype != torch.bool else mask
             mask_expanded = mask.unsqueeze(2).expand(B, N, npoint)
             dists = dists.masked_fill(~mask_expanded, float('inf'))
 
