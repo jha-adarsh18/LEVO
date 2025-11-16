@@ -128,6 +128,42 @@ def get_timestamps_from_hdf5(event_file, dt_ms=100, max_frames=None):
     
     return timestamps
 
+def load_intrinsics_from_config(config_path, sequence_name):
+    """Load camera intrinsics from config file for a specific sequence."""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    intrinsics_data = config.get('intrinsics', {})
+    
+    # Check if sequence name directly exists in config
+    if sequence_name in intrinsics_data:
+        intr = intrinsics_data[sequence_name]
+        K = torch.eye(3)
+        K[0, 0] = intr['fx']
+        K[1, 1] = intr['fy']
+        K[0, 2] = intr['cx']
+        K[1, 2] = intr['cy']
+        resolution = intr['resolution']
+        return K, resolution
+    
+    # Check if sequence is in a group
+    for group_name, group_data in intrinsics_data.items():
+        if 'sequences' in group_data:
+            # Normalize sequence names for comparison
+            normalized_sequences = [s.lower().replace('_', '-') for s in group_data['sequences']]
+            normalized_query = sequence_name.lower().replace('_', '-')
+            
+            if normalized_query in normalized_sequences:
+                K = torch.eye(3)
+                K[0, 0] = group_data['fx']
+                K[1, 1] = group_data['fy']
+                K[0, 2] = group_data['cx']
+                K[1, 2] = group_data['cy']
+                resolution = group_data['resolution']
+                return K, resolution
+    
+    raise ValueError(f"Intrinsics for sequence '{sequence_name}' not found in config")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--event-file', type=str, default='/home/adarsh/Downloads/corner_slow1.synced.left_event.hdf5')
@@ -139,13 +175,21 @@ def main():
     parser.add_argument('--d-model', type=int, default=256)
     parser.add_argument('--num-samples', type=int, default=500)
     parser.add_argument('--max-frames', type=int, default=None)
-    parser.add_argument('--resolution', type=int, nargs=2, default=[1280, 720])
+    parser.add_argument('--seq-name', type=str, default='corner_slow1', help='Sequence name to load intrinsics from config')
+    parser.add_argument('--config', type=str, default='/workspace/PEVSLAM/configs/config.yaml', help='Path to intrinsics config file')
     
     args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("Loading intrinsics from config...")
+    K_cpu, resolution = load_intrinsics_from_config(args.config, args.seq_name)
+    K = K_cpu.to(device).unsqueeze(0)
+    print(f"✓ Loaded intrinsics for '{args.seq_name}':")
+    print(f"  fx={K_cpu[0,0]:.2f}, fy={K_cpu[1,1]:.2f}, cx={K_cpu[0,2]:.2f}, cy={K_cpu[1,2]:.2f}")
+    print(f"  Resolution: {resolution}")
     
     print("Loading model...")
     model = EventVO(d_model=args.d_model, num_samples=args.num_samples).to(device)
@@ -157,8 +201,6 @@ def main():
     print("Getting timestamps...")
     timestamps = get_timestamps_from_hdf5(args.event_file, args.dt_ms, args.max_frames)
     print(f"✓ Found {len(timestamps)} frames")
-    
-    K = torch.eye(3, device=device).unsqueeze(0)
     
     R_abs = torch.eye(3, device=device)
     t_abs = torch.zeros(3, device=device)
@@ -172,8 +214,8 @@ def main():
             t1 = timestamps[i]
             t2 = timestamps[i + 1]
             
-            events1, mask1 = load_events_window(args.event_file, t1, args.event_window_ms, args.n_events, tuple(args.resolution))
-            events2, mask2 = load_events_window(args.event_file, t2, args.event_window_ms, args.n_events, tuple(args.resolution))
+            events1, mask1 = load_events_window(args.event_file, t1, args.event_window_ms, args.n_events, tuple(resolution))
+            events2, mask2 = load_events_window(args.event_file, t2, args.event_window_ms, args.n_events, tuple(resolution))
             
             events1 = torch.from_numpy(events1).unsqueeze(0).to(device)
             mask1 = torch.from_numpy(mask1).unsqueeze(0).to(device)
@@ -185,10 +227,9 @@ def main():
             R_rel = predictions['R_pred'][0]
             t_rel = predictions['t_pred'][0]
             
-            t_rel = F.normalize(t_rel, p=2, dim=0)
-            
-            R_abs = R_abs @ R_rel
+            # Bug fix 1: Update translation FIRST using old rotation, THEN update rotation
             t_abs = t_abs + R_abs @ t_rel
+            R_abs = R_abs @ R_rel
             
             quat = quaternion_from_matrix(R_abs)
             

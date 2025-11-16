@@ -46,52 +46,106 @@ def load_events_at_timestamp(h5_path, timestamp, window_ms, resolution):
     raw_events = np.stack([events_x, events_y, events_t, events_p], axis=1).astype(np.float32)
     return raw_events
 
-def create_polarity_image(raw_events, resolution):
+def create_reconstructed_image(raw_events, resolution):
+    """
+    Reconstruct a clean, sharp intensity image by integrating events.
+    This simulates what a camera would see.
+    """
     width, height = resolution
-    pos_accum = np.zeros((height, width), dtype=np.float32)
-    neg_accum = np.zeros((height, width), dtype=np.float32)
     
+    # Start with a higher resolution accumulation for smoother result
+    scale = 2
+    img_hr = np.ones((height * scale, width * scale), dtype=np.float32) * 127
+    
+    # Accumulate events at higher resolution with spatial spread
     for event in raw_events:
-        x, y, t, p = event
-        x, y = int(x), int(y)
-        if 0 <= x < width and 0 <= y < height:
-            if p > 0:
-                pos_accum[y, x] += 1
-            else:
-                neg_accum[y, x] += 1
-    
-    pos_accum = np.log1p(pos_accum)
-    neg_accum = np.log1p(neg_accum)
-    
-    pos_max = np.percentile(pos_accum[pos_accum > 0], 95) if (pos_accum > 0).any() else 1
-    neg_max = np.percentile(neg_accum[neg_accum > 0], 95) if (neg_accum > 0).any() else 1
-    
-    pos_norm = np.clip(pos_accum / pos_max * 255, 0, 255).astype(np.uint8)
-    neg_norm = np.clip(neg_accum / neg_max * 255, 0, 255).astype(np.uint8)
-    
-    img = np.zeros((height, width, 3), dtype=np.uint8)
-    img[:, :, 2] = pos_norm
-    img[:, :, 0] = neg_norm
-    
-    return img
-
-def visualize_selected_matches(img1, img2, matches):
-    h1, w1, _ = img1.shape
-    h2, w2, _ = img2.shape
-    
-    canvas = np.zeros((max(h1, h2), w1 + w2, 3), dtype=np.uint8)
-    canvas[:h1, :w1] = img1
-    canvas[:h2, w1:] = img2
-    
-    color = (0, 255, 0)
-    
-    for kp1, kp2 in matches:
-        pt1 = (int(kp1[0]), int(kp1[1]))
-        pt2 = (int(kp2[0]) + w1, int(kp2[1]))
+        x, y, t, p = event  # Note: includes t even though we don't use it
+        x_hr, y_hr = int(x * scale), int(y * scale)
         
-        cv2.line(canvas, pt1, pt2, color, 1, cv2.LINE_AA)
-        cv2.circle(canvas, pt1, 3, color, -1, cv2.LINE_AA)
-        cv2.circle(canvas, pt2, 3, color, -1, cv2.LINE_AA)
+        # Add events with small spatial kernel for smoothness
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                xx, yy = x_hr + dx, y_hr + dy
+                if 0 <= xx < width * scale and 0 <= yy < height * scale:
+                    weight = 3.0 if (dx == 0 and dy == 0) else 1.0
+                    if p > 0:
+                        img_hr[yy, xx] += weight
+                    else:
+                        img_hr[yy, xx] -= weight
+    
+    # Clip and downsample
+    img_hr = np.clip(img_hr, 0, 255).astype(np.uint8)
+    img = cv2.resize(img_hr, (width, height), interpolation=cv2.INTER_AREA)
+    
+    # Apply bilateral filter for edge-preserving smoothing
+    img_smooth = cv2.bilateralFilter(img, 7, 75, 75)
+    
+    # Gentle sharpening
+    img_blur = cv2.GaussianBlur(img_smooth, (0, 0), 2.0)
+    img_sharp = cv2.addWeighted(img_smooth, 1.5, img_blur, -0.5, 0)
+    img_sharp = np.clip(img_sharp, 0, 255).astype(np.uint8)
+    
+    # Apply CLAHE for local contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    img_enhanced = clahe.apply(img_sharp)
+    
+    # Convert to color
+    img_color = cv2.cvtColor(img_enhanced, cv2.COLOR_GRAY2BGR)
+    
+    return img_color
+
+def visualize_all_matches(images, matches_12, matches_13, matches_14):
+    """
+    Visualize matches across 4 images stacked horizontally with white separators
+    matches_12: green (0, 255, 0) - image 1 to image 2
+    matches_13: red (0, 0, 255) - image 1 to image 3
+    matches_14: blue (255, 0, 0) - image 1 to image 4
+    """
+    h, w, _ = images[0].shape
+    gap = 10  # 10 pixel gap between images
+    
+    # Create horizontal canvas with gaps
+    canvas = np.zeros((h, w * 4 + gap * 3, 3), dtype=np.uint8)
+    
+    # Place images horizontally with gaps
+    offsets = [0, w + gap, 2*w + 2*gap, 3*w + 3*gap]
+    canvas[:, offsets[0]:offsets[0]+w] = images[0]
+    canvas[:, offsets[1]:offsets[1]+w] = images[1]
+    canvas[:, offsets[2]:offsets[2]+w] = images[2]
+    canvas[:, offsets[3]:offsets[3]+w] = images[3]
+    
+    # Draw white vertical lines as separators
+    separator_color = (255, 255, 255)
+    for i in range(3):
+        sep_x = offsets[i] + w + gap // 2
+        cv2.line(canvas, (sep_x, 0), (sep_x, h-1), separator_color, 2)
+    
+    # Draw matches between image 1 and 2 (green)
+    color_12 = (0, 255, 0)
+    for kp1, kp2 in matches_12:
+        pt1 = (int(kp1[0]) + offsets[0], int(kp1[1]))
+        pt2 = (int(kp2[0]) + offsets[1], int(kp2[1]))
+        cv2.line(canvas, pt1, pt2, color_12, 1, cv2.LINE_AA)
+        cv2.circle(canvas, pt1, 3, color_12, -1, cv2.LINE_AA)
+        cv2.circle(canvas, pt2, 3, color_12, -1, cv2.LINE_AA)
+    
+    # Draw matches between image 1 and 3 (red)
+    color_13 = (0, 0, 255)
+    for kp1, kp3 in matches_13:
+        pt1 = (int(kp1[0]) + offsets[0], int(kp1[1]))
+        pt3 = (int(kp3[0]) + offsets[2], int(kp3[1]))
+        cv2.line(canvas, pt1, pt3, color_13, 1, cv2.LINE_AA)
+        cv2.circle(canvas, pt1, 3, color_13, -1, cv2.LINE_AA)
+        cv2.circle(canvas, pt3, 3, color_13, -1, cv2.LINE_AA)
+    
+    # Draw matches between image 1 and 4 (blue)
+    color_14 = (255, 0, 0)
+    for kp1, kp4 in matches_14:
+        pt1 = (int(kp1[0]) + offsets[0], int(kp1[1]))
+        pt4 = (int(kp4[0]) + offsets[3], int(kp4[1]))
+        cv2.line(canvas, pt1, pt4, color_14, 1, cv2.LINE_AA)
+        cv2.circle(canvas, pt1, 3, color_14, -1, cv2.LINE_AA)
+        cv2.circle(canvas, pt4, 3, color_14, -1, cv2.LINE_AA)
     
     return canvas
 
@@ -99,28 +153,30 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--h5-path', type=str, required=True)
     parser.add_argument('--config', type=str, required=True)
-    parser.add_argument('--timestamp1', type=float, required=True)
-    parser.add_argument('--timestamp2', type=float, required=True)
-    parser.add_argument('--output', type=str, default='selected_matches.png')
+    parser.add_argument('--timestamps', type=float, nargs=4, required=True, 
+                        help='Four timestamps')
+    parser.add_argument('--output', type=str, default='all_matches.png')
     parser.add_argument('--window-ms', type=int, default=200)
     
     args = parser.parse_args()
     
     K_event, event_resolution = load_intrinsics(args.config)
     
-    t1 = args.timestamp1
-    t2 = args.timestamp2
+    t1, t2, t3, t4 = args.timestamps
     
-    print(f"Loading events for timestamps: {t1:.6f}, {t2:.6f}")
+    print(f"Loading events for timestamps: {t1:.6f}, {t2:.6f}, {t3:.6f}, {t4:.6f}")
     
-    raw_events1 = load_events_at_timestamp(args.h5_path, t1, args.window_ms, event_resolution)
-    raw_events2 = load_events_at_timestamp(args.h5_path, t2, args.window_ms, event_resolution)
+    # Load all events
+    raw_events = []
+    for t in [t1, t2, t3, t4]:
+        events = load_events_at_timestamp(args.h5_path, t, args.window_ms, event_resolution)
+        raw_events.append(events)
     
-    print("Creating polarity images...")
-    img1 = create_polarity_image(raw_events1, event_resolution)
-    img2 = create_polarity_image(raw_events2, event_resolution)
+    print("Creating reconstructed images...")
+    images = [create_reconstructed_image(events, event_resolution) for events in raw_events]
     
-    selected_matches = [
+    # Matches between image 1 and 2 (green)
+    matches_12 = [
         ((169, 169), (173, 170)),
         ((463, 183), (466, 181)),
         ((49, 297), (54, 295)),
@@ -133,7 +189,36 @@ def main():
         ((194, 129), (196, 130))
     ]
     
-    viz = visualize_selected_matches(img1, img2, selected_matches)
+    # Matches between image 1 and 3 (red) - formerly 2_3, now using image 1 points
+    matches_13 = [
+        ((174, 168), (178, 170)),
+        ((155, 194), (162, 193)),
+        ((56, 297), (61, 297)),
+        ((299, 111), (300, 111)),
+        ((324, 201), (328, 200)),
+        ((301, 241), (304, 239)),
+        ((10, 237), (21, 240)),
+        ((466, 246), (475, 239)),
+        ((344, 240), (347, 235)),
+        ((196, 128), (203, 133))
+    ]
+    
+    # Matches between image 1 and 4 (blue) - formerly 3_4, now using image 1 points
+    matches_14 = [
+        ((203, 133), (209, 135)),
+        ((131, 141), (132, 141)),
+        ((158, 194), (166, 196)),
+        ((179, 167), (185, 168)),
+        ((527, 229), (525, 226)),
+        ((184, 233), (186, 238)),
+        ((202, 273), (216, 274)),
+        ((301, 113), (304, 115)),
+        ((58, 299), (70, 299)),
+        ((429, 94), (427, 89))
+    ]
+    
+    print("Creating visualization...")
+    viz = visualize_all_matches(images, matches_12, matches_13, matches_14)
     
     cv2.imwrite(args.output, viz)
     print(f"Saved visualization to {args.output}")

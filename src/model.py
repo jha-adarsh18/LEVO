@@ -163,19 +163,41 @@ class EventVO(nn.Module):
         self.matcher = OptimalTransportMatcher(d_desc=d_model)
         self.pose_estimator = GeometricPoseEstimator(d_model=d_model)
     
-    def forward(self, events1, mask1, events2, mask2, K=None):
+    def forward(self, events1, mask1, events2, mask2, K=None, resolution=None):
         pos1, pos2 = events1[:, :, :2], events2[:, :, :2]
         feats1 = self.backbone(events1, mask1)
         feats2 = self.backbone(events2, mask2)
         kp1, kp_feats1, scores1 = self.sampler(feats1, pos1, mask1)
         kp2, kp_feats2, scores2 = self.sampler(feats2, pos2, mask2)
+        
+        if resolution is not None:
+            B = kp1.shape[0]
+            width = resolution[:, 0].view(B, 1)
+            height = resolution[:, 1].view(B, 1)
+            
+            kp1_pixels = kp1.clone()
+            kp1_pixels[..., 0] = kp1[..., 0] * width
+            kp1_pixels[..., 1] = kp1[..., 1] * height
+            
+            kp2_pixels = kp2.clone()
+            kp2_pixels[..., 0] = kp2[..., 0] * width
+            kp2_pixels[..., 1] = kp2[..., 1] * height
+        else:
+            kp1_pixels = kp1
+            kp2_pixels = kp2
+        
         desc1, desc2 = self.cross_matcher(kp_feats1, kp_feats2)
         matches = self.matcher(desc1, desc2)
+        
         if K is None:
             K = torch.eye(3, device=events1.device).unsqueeze(0).expand(events1.shape[0], -1, -1)
-        R, t = self.pose_estimator(kp1, kp2, kp_feats1, kp_feats2, matches, K)
+        
+        R, t = self.pose_estimator(kp1_pixels, kp2_pixels, kp_feats1, kp_feats2, matches, K)
+        
         return {
-            'R_pred': R, 't_pred': t, 'keypoints1': kp1, 'keypoints2': kp2,
+            'R_pred': R, 't_pred': t,
+            'keypoints1': kp1_pixels,
+            'keypoints2': kp2_pixels,
             'descriptors1': desc1, 'descriptors2': desc2, 'matches': matches,
             'scores1': scores1, 'scores2': scores2
         }
