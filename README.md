@@ -1,2 +1,2 @@
 # LEVO
-Readme to be updated soon with final code updates
+Readme to be updated with the updated codes after a decision on the paper is out.
